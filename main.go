@@ -16,7 +16,7 @@ var (
 )
 
 func main() {
-	provider, err := parquetloader.LoadParquetIntoDB("dummy_web_logs.parquet", dbName, tableName)
+	provider, err := parquetloader.LoadParquetIntoDB("data/dummy_web_logs.parquet", dbName, tableName)
 	if err != nil {
 		log.Fatal(err)
 	}
