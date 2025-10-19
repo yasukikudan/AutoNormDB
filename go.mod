@@ -3,9 +3,9 @@ module AutoNormDb
 go 1.24.5
 
 require (
-	github.com/apache/arrow/go/v15 v15.0.2
-	github.com/dolthub/go-mysql-server v0.20.0
-	github.com/dolthub/vitess v0.0.0-20250512224608-8fb9c6ea092c
+        github.com/apache/arrow/go/v15 v15.0.2
+        github.com/dolthub/go-mysql-server v0.20.0
+        github.com/dolthub/vitess v0.0.0-20250512224608-8fb9c6ea092c
 )
 
 require (
