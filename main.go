@@ -18,7 +18,7 @@ var (
 )
 
 func main() {
-	dataDir := "data"
+	dataDir := "lake"
 
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
