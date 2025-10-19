@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
+	"strings"
 	"time"
 
 	arrow "github.com/apache/arrow/go/v15/arrow"
@@ -23,41 +25,76 @@ import (
 // database, creating the database and table as needed. It returns a DbProvider
 // ready to be served via go-mysql-server.
 func LoadParquetIntoDB(filePath, dbName, tableName string) (*memory.DbProvider, error) {
-	f, err := arrow_file.OpenParquetFile(filePath, false)
-	if err != nil {
-		return nil, fmt.Errorf("open parquet: %w", err)
-	}
-	defer f.Close()
+	db := memory.NewDatabase(dbName)
+	db.BaseDatabase.EnablePrimaryKeyIndexes()
+	pro := memory.NewDBProvider(db)
 
-	ctx := context.Background()
-	pool := arrow_memory.NewGoAllocator()
-	props := arrow_pqarrow.ArrowReadProperties{BatchSize: 4096}
-	fr, err := arrow_pqarrow.NewFileReader(f, props, pool)
-	if err != nil {
-		return nil, fmt.Errorf("new pqarrow reader: %w", err)
+	if err := loadParquetFileIntoDB(context.Background(), filePath, dbName, tableName, db, pro); err != nil {
+		return nil, err
 	}
 
-	rr, err := fr.GetRecordReader(ctx, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("get record reader: %w", err)
-	}
-	defer rr.Release()
+	return pro, nil
+}
 
-	arSchema := rr.Schema()
-	sqlSchema, err := makeSQLSchemaFromArrow(arSchema, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("make sql schema: %w", err)
+// LoadParquetFilesIntoDB loads multiple parquet files into the same database. Each
+// file will become a table named after the file's base name without the
+// extension.
+func LoadParquetFilesIntoDB(filePaths []string, dbName string) (*memory.DbProvider, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("no parquet files provided")
 	}
 
 	db := memory.NewDatabase(dbName)
 	db.BaseDatabase.EnablePrimaryKeyIndexes()
 	pro := memory.NewDBProvider(db)
 
+	ctx := context.Background()
+	for _, filePath := range filePaths {
+		tableName := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+		if tableName == "" {
+			return nil, fmt.Errorf("could not derive table name from %q", filePath)
+		}
+
+		if err := loadParquetFileIntoDB(ctx, filePath, dbName, tableName, db, pro); err != nil {
+			return nil, err
+		}
+	}
+
+	return pro, nil
+}
+
+func loadParquetFileIntoDB(ctx context.Context, filePath, dbName, tableName string, db *memory.Database, pro *memory.DbProvider) error {
+	f, err := arrow_file.OpenParquetFile(filePath, false)
+	if err != nil {
+		return fmt.Errorf("open parquet %q: %w", filePath, err)
+	}
+	defer f.Close()
+
+	pool := arrow_memory.NewGoAllocator()
+	props := arrow_pqarrow.ArrowReadProperties{BatchSize: 4096}
+	fr, err := arrow_pqarrow.NewFileReader(f, props, pool)
+	if err != nil {
+		return fmt.Errorf("new pqarrow reader for %q: %w", filePath, err)
+	}
+
+	rr, err := fr.GetRecordReader(ctx, nil, nil)
+	if err != nil {
+		return fmt.Errorf("get record reader for %q: %w", filePath, err)
+	}
+	defer rr.Release()
+
+	arSchema := rr.Schema()
+	sqlSchema, err := makeSQLSchemaFromArrow(arSchema, tableName)
+	if err != nil {
+		return fmt.Errorf("make sql schema for %q: %w", filePath, err)
+	}
+
 	pkSchema := sql.NewPrimaryKeySchema(sqlSchema)
 	tbl := memory.NewTable(db, tableName, pkSchema, db.GetForeignKeyCollection())
 	db.AddTable(tableName, tbl)
 
 	sess := memory.NewSession(sql.NewBaseSession(), pro)
+	sess.SetCurrentDatabase(dbName)
 	qctx := sql.NewContext(ctx, sql.WithSession(sess))
 
 	inserted := 0
@@ -84,13 +121,13 @@ func LoadParquetIntoDB(filePath, dbName, tableName string) (*memory.DbProvider, 
 				val, convErr := valueAt(col, arSchema.Field(c), r)
 				if convErr != nil {
 					rec.Release()
-					return nil, fmt.Errorf("convert value col=%d row=%d: %w", c, r, convErr)
+					return fmt.Errorf("convert value col=%d row=%d in %q: %w", c, r, filePath, convErr)
 				}
 				rowVals[c] = val
 			}
 			if err := tbl.Insert(qctx, sql.NewRow(rowVals...)); err != nil {
 				rec.Release()
-				return nil, fmt.Errorf("insert row %d: %w", r, err)
+				return fmt.Errorf("insert row %d in %q: %w", r, filePath, err)
 			}
 			inserted++
 		}
@@ -99,10 +136,10 @@ func LoadParquetIntoDB(filePath, dbName, tableName string) (*memory.DbProvider, 
 		batch++
 	}
 
-	log.Printf("batches=%d inserted=%d", batch, inserted)
+	log.Printf("batches=%d inserted=%d for table %s from %s", batch, inserted, tableName, filePath)
 	log.Printf("Imported %d rows into %s.%s", inserted, dbName, tableName)
 
-	return pro, nil
+	return nil
 }
 
 func makeSQLSchemaFromArrow(s *arrow.Schema, tableName string) (sql.Schema, error) {
