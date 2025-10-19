@@ -17,7 +17,16 @@ func Start(pro sql.DatabaseProvider, addr string) error {
 		Protocol: "tcp",
 		Address:  addr,
 	}
-	s, err := server.NewServer(cfg, engine, sql.NewContext, sql.BaseSessionFromConnection, nil)
+	sessionBuilder := server.SessionBuilder(func(ctx context.Context, conn *mysql.Conn, addr string) (sql.Session, error) {
+		base, err := sql.BaseSessionFromConnection(ctx, conn, addr)
+		if err != nil {
+			return nil, err
+		}
+		return base, nil
+	})
+
+	s, err := server.NewServer(cfg, engine, sql.NewContext, sessionBuilder, nil)
+
 	if err != nil {
 		return err
 	}
