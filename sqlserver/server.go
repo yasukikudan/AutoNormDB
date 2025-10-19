@@ -26,6 +26,7 @@ func Start(pro sql.DatabaseProvider, addr string) error {
 	})
 
 	s, err := server.NewServer(cfg, engine, sql.NewContext, sessionBuilder, nil)
+
 	if err != nil {
 		return err
 	}
