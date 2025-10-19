@@ -1,11 +1,13 @@
 package sqlserver
 
 import (
+	"context"
 	"log"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/vitess/go/mysql"
 )
 
 // Start launches a MySQL-compatible server backed by the provided DatabaseProvider on the given address.
