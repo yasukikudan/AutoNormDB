@@ -43,3 +43,12 @@ ORDER BY request_count DESC;
 ```
 
 読み込まれたテーブルを活用してデータセットの探索をお楽しみください。
+
+## SQLTools での実行例
+VS Code の [SQLTools](https://marketplace.visualstudio.com/items?itemName=mtxr.sqltools) を利用すると、GUI 上でスキーマの確認やクエリの実行が行えます。
+
+| テーブルスキーマの確認 | 集計クエリの実行 |
+| --- | --- |
+| ![SQLTools で表示した `dummy_web_logs` テーブルのカラム一覧](docs/sqltools-table-columns.svg) | ![ステータス別リクエスト件数を求めるクエリ結果の例](docs/sqltools-query-results.svg) |
+
+左のスクリーンショットでは `dummy_web_logs` テーブルに含まれるカラム名とデータ型を確認でき、右のスクリーンショットではステータスごとに件数を集計するクエリの実行結果を確認できます。

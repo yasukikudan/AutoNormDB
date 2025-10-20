@@ -1,5 +1,9 @@
 package arrowtable
 
+// このファイルでは Arrow のレコードバッチを go-mysql-server の行イテレータに変換する
+// 実装を提供します。Arrow の列指向データを行指向で取り出し、SQL エンジンが 1 行ずつ
+// 消費できるように変換するのが主目的です。
+
 import (
 	"io"
 	"math"
@@ -18,11 +22,14 @@ type arrowRowIter struct {
 func newArrowRowIter(tbl arrow.Table, chunkIdx int) sql.RowIter {
 	numCols := int(tbl.NumCols())
 	if numCols == 0 {
+		// 列が存在しないテーブル（たとえば COUNT 用に論理行だけがあるケース）では、空の
+		// 行を指定された件数分返すイテレータを生成します。
 		return &arrowRowIter{cols: nil, row: 0, n: int(tbl.NumRows())}
 	}
 
 	cols := make([]arrow.Array, numCols)
 	for c := 0; c < numCols; c++ {
+		// 各列について対象チャンクの配列を Retain し、イテレータが Close されるまで寿命を確保します。
 		chunk := tbl.Column(c).Data().Chunk(chunkIdx)
 		chunk.Retain()
 		cols[c] = chunk
@@ -33,10 +40,12 @@ func newArrowRowIter(tbl arrow.Table, chunkIdx int) sql.RowIter {
 
 func (it *arrowRowIter) Next(*sql.Context) (sql.Row, error) {
 	if it.row >= it.n {
+		// すべての行を読み終えたら io.EOF を返してイテレーション完了を通知します。
 		return nil, io.EOF
 	}
 
 	if len(it.cols) == 0 {
+		// 列なしテーブルでは空行（長さ 0 の sql.Row）を返しつつ、行カウントを進めます。
 		it.row++
 		return sql.Row{}, nil
 	}
@@ -44,9 +53,11 @@ func (it *arrowRowIter) Next(*sql.Context) (sql.Row, error) {
 	r := make(sql.Row, len(it.cols))
 	for i, col := range it.cols {
 		if col.IsNull(it.row) {
+			// Arrow のヌル値は go-mysql-server では nil として扱うため、そのまま設定します。
 			r[i] = nil
 			continue
 		}
+		// 列データ型に応じた Go 値を抽出し、sql.Row に格納します。
 		r[i] = valueAt(col, it.row)
 	}
 
@@ -55,6 +66,7 @@ func (it *arrowRowIter) Next(*sql.Context) (sql.Row, error) {
 }
 
 func (it *arrowRowIter) Close(*sql.Context) error {
+	// Retain していた列配列の参照カウントを減らし、メモリ解放を促します。
 	for _, col := range it.cols {
 		col.Release()
 	}
@@ -63,6 +75,8 @@ func (it *arrowRowIter) Close(*sql.Context) error {
 }
 
 func valueAt(col arrow.Array, idx int) any {
+	// Arrow の各配列型に対応する go-mysql-server の型へ変換します。符号なし整数は MySQL が
+	// 符号付き 64bit 整数で扱うため、オーバーフローを避ける処理を加えています。
 	switch arr := col.(type) {
 	case *array.Int8:
 		return arr.Value(idx)
@@ -107,6 +121,7 @@ func valueAt(col arrow.Array, idx int) any {
 	case *array.Date64:
 		return int64(arr.Value(idx))
 	default:
+		// 未対応型に遭遇した場合は nil を返し、呼び出し側で後続処理を検討できるようにします。
 		return nil
 	}
 }

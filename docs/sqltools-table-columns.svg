@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="520" viewBox="0 0 800 520">
+  <defs>
+    <style>
+      .bg { fill: #20252c; }
+      .panel { fill: #1b1f24; stroke: #4b535d; stroke-width: 2; }
+      .title { fill: #ced4e0; font-family: 'Segoe UI', sans-serif; font-size: 20px; }
+      .header { fill: #9da5b4; font-family: 'Segoe UI', sans-serif; font-size: 16px; }
+      .col-name { fill: #e6ebf4; font-family: 'Consolas', monospace; font-size: 16px; }
+      .col-type { fill: #92a0b5; font-family: 'Consolas', monospace; font-size: 16px; }
+    </style>
+  </defs>
+  <rect class="bg" width="800" height="520" rx="16"/>
+  <rect class="panel" x="24" y="24" width="752" height="472" rx="12"/>
+  <text class="title" x="48" y="68">SQLTools — AutoNormDB &gt; dummy_web_logs</text>
+  <text class="header" x="60" y="108">Column</text>
+  <text class="header" x="360" y="108">Type</text>
+  <g>
+    <text class="col-name" x="60" y="144">ts</text>
+    <text class="col-type" x="360" y="144">BIGINT</text>
+    <text class="col-name" x="60" y="176">ip</text>
+    <text class="col-type" x="360" y="176">LONGTEXT</text>
+    <text class="col-name" x="60" y="208">method</text>
+    <text class="col-type" x="360" y="208">LONGTEXT</text>
+    <text class="col-name" x="60" y="240">host</text>
+    <text class="col-type" x="360" y="240">LONGTEXT</text>
+    <text class="col-name" x="60" y="272">status</text>
+    <text class="col-type" x="360" y="272">BIGINT</text>
+    <text class="col-name" x="60" y="304">http_version</text>
+    <text class="col-type" x="360" y="304">LONGTEXT</text>
+    <text class="col-name" x="60" y="336">bytes</text>
+    <text class="col-type" x="360" y="336">BIGINT</text>
+    <text class="col-name" x="60" y="368">referrer</text>
+    <text class="col-type" x="360" y="368">LONGTEXT</text>
+    <text class="col-name" x="60" y="400">user_agent</text>
+    <text class="col-type" x="360" y="400">LONGTEXT</text>
+    <text class="col-name" x="60" y="432">response_time_ms</text>
+    <text class="col-type" x="360" y="432">BIGINT</text>
+    <text class="col-name" x="60" y="464">session_id</text>
+    <text class="col-type" x="360" y="464">LONGTEXT</text>
+    <text class="col-name" x="420" y="144">request_id</text>
+    <text class="col-type" x="620" y="144">LONGTEXT</text>
+    <text class="col-name" x="420" y="176">country</text>
+    <text class="col-type" x="620" y="176">LONGTEXT</text>
+    <text class="col-name" x="420" y="208">path</text>
+    <text class="col-type" x="620" y="208">LONGTEXT</text>
+  </g>
+</svg>

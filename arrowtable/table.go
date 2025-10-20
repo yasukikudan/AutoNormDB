@@ -1,5 +1,9 @@
 package arrowtable
 
+// このファイルでは Apache Arrow のテーブルを go-mysql-server 互換の sql.Table として
+// 露出させるラッパーを提供します。Arrow のレコードバッチを go-mysql-server のパーティション
+// にマッピングし、SQL 実行エンジンから効率的に行イテレーションできるようにしています。
+
 import (
 	"encoding/binary"
 
@@ -51,6 +55,8 @@ type chunkPartition struct {
 }
 
 func (p *chunkPartition) Key() []byte {
+	// go-mysql-server ではパーティションの識別子をバイト列で返す必要があるため、チャンク番号を
+	// 32bit のビッグエンディアン整数としてエンコードします。これにより安定した順序付けが可能です。
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, uint32(p.idx))
 	return buf
@@ -88,6 +94,8 @@ func (t *ArrowBackedTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
 	_ = ctx
 	cp := p.(*chunkPartition)
+	// 指定されたパーティション（＝ Arrow のチャンク）に対応する行イテレータを生成します。
+	// newArrowRowIter はチャンク内の列配列を Retain し、呼び出し側の Close で解放する設計です。
 	return newArrowRowIter(t.arrTable, cp.idx), nil
 }
 
