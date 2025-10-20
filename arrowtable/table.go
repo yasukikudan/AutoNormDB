@@ -10,6 +10,9 @@ import (
 // ArrowBackedTable exposes an in-memory Arrow table through the sql.Table
 // interface expected by go-mysql-server. Each Arrow RecordBatch (chunk) becomes
 // a partition that the engine can iterate independently.
+// ArrowBackedTable は、go-mysql-server が期待する sql.Table インターフェースを
+// 介してメモリ上の Arrow テーブルを公開します。各 Arrow RecordBatch（チャンク）が
+// 1 つのパーティションとなり、エンジンはそれぞれを独立して走査できます。
 type ArrowBackedTable struct {
 	name     string
 	schema   sql.Schema
@@ -18,6 +21,9 @@ type ArrowBackedTable struct {
 
 // NewArrowBackedTable wraps the provided Arrow table. The Arrow table is
 // retained so that it remains valid for the lifetime of the ArrowBackedTable.
+// NewArrowBackedTable は引数として受け取った Arrow テーブルをラップします。
+// Arrow テーブルは Retain され、ArrowBackedTable のライフタイム全体で有効な
+// 参照が保たれるようにしています。
 func NewArrowBackedTable(name string, arrTable arrow.Table) (*ArrowBackedTable, error) {
 	schema, err := ArrowSchemaToSQLSchema(arrTable.Schema(), name)
 	if err != nil {
@@ -29,12 +35,15 @@ func NewArrowBackedTable(name string, arrTable arrow.Table) (*ArrowBackedTable, 
 }
 
 // Name implements sql.Table.
+// sql.Table インターフェースで要求される Name メソッドを実装し、テーブル名を返します。
 func (t *ArrowBackedTable) Name() string { return t.name }
 
 // String implements fmt.Stringer for debugging convenience.
+// fmt.Stringer を実装しており、デバッグ時にテーブル名を文字列として扱いやすくします。
 func (t *ArrowBackedTable) String() string { return t.name }
 
 // Schema implements sql.Table.
+// sql.Table の Schema メソッドを実装し、SQL 用のスキーマ情報を返します。
 func (t *ArrowBackedTable) Schema() sql.Schema { return t.schema }
 
 type chunkPartition struct {
@@ -48,6 +57,9 @@ func (p *chunkPartition) Key() []byte {
 }
 
 // Partitions implements sql.Table. Each Arrow chunk becomes one partition.
+// Partitions は sql.Table の要件を満たし、各 Arrow チャンクを 1 つのパーティションとして扱います。
+// Arrow の列データが存在する場合はチャンク数を基準に、列がなく行数のみがある場合は
+// 論理的な行数に対応する 1 つのパーティションを用意することで、空行を返しつつ行数を保証します。
 func (t *ArrowBackedTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 	numChunks := 0
 	if t.arrTable.NumCols() > 0 {
@@ -71,6 +83,8 @@ func (t *ArrowBackedTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 }
 
 // PartitionRows implements sql.PartitionedTable.
+// sql.PartitionedTable の PartitionRows を実装し、指定されたパーティションに対応する
+// Arrow データから行イテレータを生成します。
 func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
 	_ = ctx
 	cp := p.(*chunkPartition)
@@ -79,6 +93,8 @@ func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql
 
 // Collation implements sql.Table Collation support; Arrow arrays are
 // byte-oriented so we return the default collation.
+// Collation は sql.Table の照合順序サポートを実装します。Arrow 配列はバイト配列ベースで
+// 表現されるため、デフォルトの照合順序（Collation_Default）を返します。
 func (t *ArrowBackedTable) Collation() sql.CollationID {
 	return sql.Collation_Default
 }
