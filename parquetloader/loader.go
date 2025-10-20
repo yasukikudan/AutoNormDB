@@ -90,7 +90,6 @@ func loadParquetFileIntoDB(ctx context.Context, filePath, tableName string, db *
 		records = append(records, rec)
 		totalRows += int64(rec.NumRows())
 		batches++
-		rec.Release()
 	}
 
 	arrTable := arrow_array.NewTableFromRecords(schema, records)
