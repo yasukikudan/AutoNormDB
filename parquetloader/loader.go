@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/apache/arrow/go/v15/arrow"
 	arrow_array "github.com/apache/arrow/go/v15/arrow/array"
 	arrow_memory "github.com/apache/arrow/go/v15/arrow/memory"
 	arrow_file "github.com/apache/arrow/go/v15/parquet/file"
@@ -76,7 +77,7 @@ func loadParquetFileIntoDB(ctx context.Context, filePath, tableName string, db *
 	defer rr.Release()
 
 	schema := rr.Schema()
-	var records []arrow_array.Record
+	var records []arrow.Record
 	totalRows := int64(0)
 	batches := 0
 
