@@ -1,6 +1,6 @@
 # AutoNormDB
 
-AutoNormDB はサンプルデータセット `dummy_web_logs.parquet` を読み込み、[go-mysql-server](https://github.com/dolthub/go-mysql-server) を利用してメモリ上に MySQL 互換サーバーを起動します。起動後は `AutoNormDB` というデータベース内に `mytable` というテーブルが 1 つだけ用意されます。
+AutoNormDB は `lake/` ディレクトリ以下の Parquet ファイルを自動的に読み込み、[go-mysql-server](https://github.com/dolthub/go-mysql-server) を利用してメモリ上に MySQL 互換サーバーを起動します。起動後は各 Parquet ファイルの拡張子を除いたファイル名がテーブル名として登録され、`AutoNormDB` というデータベースから参照できます。
 
 ## 前提条件
 - `go.mod` で宣言されているバージョンに合わせた Go 1.24.5 以上
@@ -13,7 +13,7 @@ AutoNormDB はサンプルデータセット `dummy_web_logs.parquet` を読み�
 go run main.go
 ```
 
-このコマンドは Parquet ファイルを読み込み、`localhost:3306` で待ち受ける SQL サーバーを立ち上げます。サーバーを利用する間はプロセスを実行したままにしておき、終了する際は `Ctrl+C` で停止してください。
+このコマンドは `lake/` ディレクトリ配下から Parquet ファイルを検出して読み込み、`localhost:3306` で待ち受ける SQL サーバーを立ち上げます。サーバーを利用する間はプロセスを実行したままにしておき、終了する際は `Ctrl+C` で停止してください。
 
 ## MySQL クライアントからの接続
 サーバーが起動している状態で、`main.go` に定義されている以下の接続情報を使用します。
@@ -21,7 +21,7 @@ go run main.go
 - **ホスト:** `localhost`
 - **ポート:** `3306`
 - **データベース:** `AutoNormDB`
-- **テーブル:** `mytable`
+- **テーブル:** `lake/` 配下の Parquet ファイル名（例: `dummy_web_logs.parquet` → テーブル名 `dummy_web_logs`）
 - **ユーザー名:** `root`（go-mysql-server のデフォルト）
 - **パスワード:** なし
 
@@ -31,10 +31,15 @@ MySQL CLI を使った接続例:
 mysql -h localhost -P 3306 -u root AutoNormDB
 ```
 
-接続後は、例えば次のようにテーブルをクエリできます。
+接続後は、例えば次のようにステータスごとのリクエスト件数を集計できます。
 
 ```sql
-SELECT * FROM mytable LIMIT 10;
+SELECT
+  status,
+  COUNT(*) AS request_count
+FROM dummy_web_logs
+GROUP BY status
+ORDER BY request_count DESC;
 ```
 
-データセットの探索をお楽しみください。
+読み込まれたテーブルを活用してデータセットの探索をお楽しみください。
