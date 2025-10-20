@@ -1,5 +1,9 @@
 package arrowtable
 
+// Arrow のスキーマ情報を go-mysql-server の SQL スキーマに変換するユーティリティです。
+// ここで型対応表を定義することで、Parquet から読み込んだ Arrow テーブルを SQL テーブル
+// として認識させることができます。
+
 import (
 	"fmt"
 
@@ -17,10 +21,13 @@ func ArrowSchemaToSQLSchema(s *arrow.Schema, source string) (sql.Schema, error) 
 	cols := make(sql.Schema, len(fields))
 
 	for i, f := range fields {
+		// Arrow のフィールド型を go-mysql-server が理解できる sql.Type に変換します。
 		typ, err := arrowFieldToSQLType(f)
 		if err != nil {
 			return nil, err
 		}
+		// go-mysql-server では各列がどのテーブル由来かを Source で管理するため、引数で受け取った
+		// source 名を設定します。Nullable フラグも Arrow の定義を踏襲します。
 		cols[i] = &sql.Column{
 			Name:     f.Name,
 			Type:     typ,
@@ -33,6 +40,8 @@ func ArrowSchemaToSQLSchema(s *arrow.Schema, source string) (sql.Schema, error) 
 }
 
 func arrowFieldToSQLType(f arrow.Field) (sql.Type, error) {
+	// Arrow のデータ型を go-mysql-server の型にマッピングします。MySQL 側でサポートの薄い
+	// 型はより広い互換型（例: 文字列は LongText）へフォールバックしています。
 	switch f.Type.(type) {
 	case *arrow.Int8Type, *arrow.Uint8Type:
 		return types.Int8, nil
@@ -53,6 +62,8 @@ func arrowFieldToSQLType(f arrow.Field) (sql.Type, error) {
 	case *arrow.BinaryType, *arrow.LargeBinaryType, *arrow.FixedSizeBinaryType:
 		return types.LongBlob, nil
 	default:
+		// マッピング表に存在しない型に遭遇した場合はエラーとして返し、呼び出し元で
+		// 適切な対処（例えばスキップやカスタム変換）を行ってもらいます。
 		return nil, fmt.Errorf("unsupported Arrow type for column %q: %s", f.Name, f.Type)
 	}
 }
