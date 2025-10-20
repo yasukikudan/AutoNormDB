@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="520" viewBox="0 0 800 520">
+  <defs>
+    <style>
+      .bg { fill: #1d232a; }
+      .panel { fill: #161a20; stroke: #4b535d; stroke-width: 2; }
+      .code-keyword { fill: #6dc7ff; font-family: 'Consolas', monospace; font-size: 18px; }
+      .code-text { fill: #d8dee9; font-family: 'Consolas', monospace; font-size: 18px; }
+      .table-header { fill: #9da5b4; font-family: 'Segoe UI', sans-serif; font-size: 16px; }
+      .table-cell { fill: #eceff4; font-family: 'Segoe UI', sans-serif; font-size: 16px; }
+      .caption { fill: #ced4e0; font-family: 'Segoe UI', sans-serif; font-size: 18px; }
+    </style>
+  </defs>
+  <rect class="bg" width="800" height="520" rx="16"/>
+  <rect class="panel" x="24" y="24" width="752" height="472" rx="12"/>
+  <text class="caption" x="48" y="68">SQLTools — Query</text>
+  <text class="code-keyword" x="60" y="120">SELECT</text>
+  <text class="code-text" x="140" y="120">status,</text>
+  <text class="code-text" x="140" y="148">COUNT(*) AS request_count</text>
+  <text class="code-keyword" x="60" y="176">FROM</text>
+  <text class="code-text" x="140" y="176">dummy_web_logs</text>
+  <text class="code-keyword" x="60" y="204">GROUP BY</text>
+  <text class="code-text" x="180" y="204">status</text>
+  <text class="code-keyword" x="60" y="232">ORDER BY</text>
+  <text class="code-text" x="180" y="232">request_count DESC;</text>
+  <rect fill="#20252c" x="48" y="276" width="704" height="200" rx="8"/>
+  <text class="table-header" x="72" y="308">status</text>
+  <text class="table-header" x="220" y="308">request_count</text>
+  <g>
+    <text class="table-cell" x="72" y="340">200</text>
+    <text class="table-cell" x="220" y="340">5389</text>
+    <text class="table-cell" x="72" y="368">404</text>
+    <text class="table-cell" x="220" y="368">1277</text>
+    <text class="table-cell" x="72" y="396">302</text>
+    <text class="table-cell" x="220" y="396">635</text>
+    <text class="table-cell" x="72" y="424">500</text>
+    <text class="table-cell" x="220" y="424">504</text>
+    <text class="table-cell" x="72" y="452">301</text>
+    <text class="table-cell" x="220" y="452">301</text>
+  </g>
+</svg>
