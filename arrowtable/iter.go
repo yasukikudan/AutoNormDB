@@ -38,6 +38,22 @@ func newArrowRowIter(tbl arrow.Table, chunkIdx int) sql.RowIter {
 	return &arrowRowIter{cols: cols, row: 0, n: cols[0].Len()}
 }
 
+func newArrowRowIterFromRecord(rec arrow.Record) sql.RowIter {
+	if rec == nil {
+		return &arrowRowIter{cols: nil, row: 0, n: 0}
+	}
+
+	numCols := int(rec.NumCols())
+	cols := make([]arrow.Array, numCols)
+	for i := 0; i < numCols; i++ {
+		col := rec.Column(i)
+		col.Retain()
+		cols[i] = col
+	}
+
+	return &arrowRowIter{cols: cols, row: 0, n: int(rec.NumRows())}
+}
+
 func (it *arrowRowIter) Next(*sql.Context) (sql.Row, error) {
 	if it.row >= it.n {
 		// すべての行を読み終えたら io.EOF を返してイテレーション完了を通知します。
