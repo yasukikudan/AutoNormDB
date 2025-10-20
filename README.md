@@ -49,6 +49,6 @@ VS Code の [SQLTools](https://marketplace.visualstudio.com/items?itemName=mtxr.
 
 | テーブルスキーマの確認 | 集計クエリの実行 |
 | --- | --- |
-| ![SQLTools で表示した `dummy_web_logs` テーブルのカラム一覧](docs/sqltools-table-columns.svg) | ![ステータス別リクエスト件数を求めるクエリ結果の例](docs/sqltools-query-results.svg) |
+| ![SQLTools のシステムビューで表示した `dummy_web_logs` テーブルのカラム一覧](img/img1.png) | ![SQLTools でステータス別リクエスト件数を求めるクエリを実行した例](img/img2.png) |
 
-左のスクリーンショットでは `dummy_web_logs` テーブルに含まれるカラム名とデータ型を確認でき、右のスクリーンショットではステータスごとに件数を集計するクエリの実行結果を確認できます。
+左のスクリーンショットでは SQLTools のシステムビューから `dummy_web_logs` テーブルに含まれるカラム名とデータ型を確認でき、右のスクリーンショットではステータスごとに件数を集計するクエリを実行した結果を確認できます。
