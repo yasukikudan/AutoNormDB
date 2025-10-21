@@ -9,7 +9,6 @@ import (
 	"time"
 
 	sqle "github.com/dolthub/go-mysql-server"
-	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"AutoNormDb/internal/arrowfile"
@@ -25,12 +24,15 @@ func main() {
 		log.Fatal("provide a SQL query with -q")
 	}
 
-	db := arrowfile.NewFileDatabase("files")
-	db.AllowedRoots = splitRoots(*rootsFlag)
-	db.EnableGlob = *enableGlob
-	db.Cache = arrowfile.NewTableCache(8, time.Minute)
+	cfg := arrowfile.ProviderConfig{
+		DatabaseName: "AutoNormDB",
+		AllowedRoots: splitRoots(*rootsFlag),
+		EnableGlob:   *enableGlob,
+		CacheEntries: 8,
+		CacheTTL:     time.Minute,
+	}
 
-	provider := memory.NewDBProvider(db)
+	provider := arrowfile.NewProvider(cfg)
 	engine := sqle.NewDefault(provider)
 	ctx := sql.NewEmptyContext()
 
