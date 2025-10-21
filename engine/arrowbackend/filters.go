@@ -1,8 +1,9 @@
-package arrowtable
+package arrowbackend
 
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -12,11 +13,11 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/expression"
 )
 
-// buildMaskForBatch converts the pushed down SQL expressions into Arrow compute
+// BuildMaskForBatch converts the pushed down SQL expressions into Arrow compute
 // predicates and combines them using AND semantics. The resulting boolean array
 // can be consumed by FilterRecordBatch to physically prune rows from the
 // provided record batch.
-func buildMaskForBatch(ctx context.Context, rb arrow.Record, pushed []sql.Expression) (arrow.Array, error) {
+func BuildMaskForBatch(ctx context.Context, rb arrow.Record, pushed []sql.Expression) (arrow.Array, error) {
 	if len(pushed) == 0 {
 		builder := array.NewBooleanBuilder(memory.DefaultAllocator)
 		defer builder.Release()
@@ -59,6 +60,35 @@ func buildMaskForBatch(ctx context.Context, rb arrow.Record, pushed []sql.Expres
 		return nil, fmt.Errorf("unexpected datum type %T for filter output", combined)
 	}
 	return arrDatum.MakeArray(), nil
+}
+
+// CanHandleForCompute reports whether the provided expression tree can be
+// evaluated using Arrow compute kernels.
+func CanHandleForCompute(e sql.Expression) bool {
+	switch ex := e.(type) {
+	case *expression.Equals,
+		*expression.GreaterThan,
+		*expression.GreaterThanOrEqual,
+		*expression.LessThan,
+		*expression.LessThanOrEqual:
+		be := ex.(expression.BinaryExpression)
+		return operandSupported(be.Left()) && operandSupported(be.Right())
+	case *expression.Between:
+		return operandSupported(ex.Val) && operandSupported(ex.Lower) && operandSupported(ex.Upper)
+	case *expression.And:
+		return CanHandleForCompute(ex.LeftChild) && CanHandleForCompute(ex.RightChild)
+	default:
+		return false
+	}
+}
+
+func operandSupported(e sql.Expression) bool {
+	switch e.(type) {
+	case *expression.GetField, *expression.Literal:
+		return true
+	default:
+		return false
+	}
 }
 
 func compileOnePredicate(ctx context.Context, rb arrow.Record, pred sql.Expression) (compute.Datum, error) {
@@ -142,13 +172,15 @@ func compare(ctx context.Context, rb arrow.Record, left, right sql.Expression, o
 func toDatum(rb arrow.Record, expr sql.Expression) (compute.Datum, error) {
 	switch e := expr.(type) {
 	case *expression.GetField:
-		name := e.Name()
-		idxs := rb.Schema().FieldIndices(name)
-		if len(idxs) == 0 {
-			return nil, sql.ErrTableColumnNotFound.New(name)
+		name := strings.ToLower(e.Name())
+		schema := rb.Schema()
+		for i := 0; i < int(schema.NumFields()); i++ {
+			if strings.ToLower(schema.Field(i).Name) == name {
+				col := rb.Column(i)
+				return compute.NewDatum(col), nil
+			}
 		}
-		col := rb.Column(idxs[0])
-		return compute.NewDatum(col), nil
+		return nil, sql.ErrTableColumnNotFound.New(e.Name())
 	case *expression.Literal:
 		return compute.NewDatum(e.Val), nil
 	default:
