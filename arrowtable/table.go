@@ -15,7 +15,8 @@ import (
 	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/compute"
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/expression"
+
+	"AutoNormDb/engine/arrowbackend"
 )
 
 const PartitionSize = 1 << 16
@@ -92,7 +93,7 @@ func (t *ArrowBackedTable) Filters() []sql.Expression {
 func (t *ArrowBackedTable) HandledFilters(filters []sql.Expression) []sql.Expression {
 	var handled []sql.Expression
 	for _, f := range filters {
-		if canHandleForCompute(f) {
+		if arrowbackend.CanHandleForCompute(f) {
 			handled = append(handled, f)
 		}
 	}
@@ -180,7 +181,7 @@ func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql
 			continue
 		}
 
-		mask, err := buildMaskForBatch(goCtx, rec, t.pushed)
+		mask, err := arrowbackend.BuildMaskForBatch(goCtx, rec, t.pushed)
 		if err != nil {
 			rec.Release()
 			closeAll()
@@ -310,33 +311,6 @@ func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
 		pm.Parts = append(pm.Parts, current)
 	}
 	return pm, nil
-}
-
-func canHandleForCompute(e sql.Expression) bool {
-	switch ex := e.(type) {
-	case *expression.Equals,
-		*expression.GreaterThan,
-		*expression.GreaterThanOrEqual,
-		*expression.LessThan,
-		*expression.LessThanOrEqual:
-		be := ex.(expression.BinaryExpression)
-		return operandSupported(be.Left()) && operandSupported(be.Right())
-	case *expression.Between:
-		return operandSupported(ex.Val) && operandSupported(ex.Lower) && operandSupported(ex.Upper)
-	case *expression.And:
-		return canHandleForCompute(ex.LeftChild) && canHandleForCompute(ex.RightChild)
-	default:
-		return false
-	}
-}
-
-func operandSupported(e sql.Expression) bool {
-	switch e.(type) {
-	case *expression.GetField, *expression.Literal:
-		return true
-	default:
-		return false
-	}
 }
 
 type chainedIter struct {
