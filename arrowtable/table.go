@@ -7,6 +7,9 @@ package arrowtable
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -15,44 +18,61 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/expression"
 )
 
+const PartitionSize = 1 << 16
+
+type RowRange struct {
+	Chunk  int
+	Offset int64
+	Length int64
+}
+
+type PartitionMeta struct {
+	Index    int
+	RowCount int64
+	Segments []RowRange
+}
+
+type PartitionManager struct {
+	Parts []*PartitionMeta
+}
+
 // ArrowBackedTable exposes an in-memory Arrow table through the sql.Table
-// interface expected by go-mysql-server. Each Arrow RecordBatch (chunk) becomes
-// a partition that the engine can iterate independently.
-// ArrowBackedTable は、go-mysql-server が期待する sql.Table インターフェースを
-// 介してメモリ上の Arrow テーブルを公開します。各 Arrow RecordBatch（チャンク）が
-// 1 つのパーティションとなり、エンジンはそれぞれを独立して走査できます。
+// interface expected by go-mysql-server. Each partition comprises 65,536 rows at
+// most and may span multiple Arrow chunks.
 type ArrowBackedTable struct {
 	name     string
 	schema   sql.Schema
 	arrTable arrow.Table
 	pushed   []sql.Expression
+	pm       *PartitionManager
 }
 
 // NewArrowBackedTable wraps the provided Arrow table. The Arrow table is
 // retained so that it remains valid for the lifetime of the ArrowBackedTable.
-// NewArrowBackedTable は引数として受け取った Arrow テーブルをラップします。
-// Arrow テーブルは Retain され、ArrowBackedTable のライフタイム全体で有効な
-// 参照が保たれるようにしています。
+// A row-count-based partition manager is constructed so that the table can be
+// consumed through go-mysql-server's partitioned table interface.
 func NewArrowBackedTable(name string, arrTable arrow.Table) (*ArrowBackedTable, error) {
 	schema, err := ArrowSchemaToSQLSchema(arrTable.Schema(), name)
 	if err != nil {
 		return nil, err
 	}
 
+	pm, err := buildPartitionManager(arrTable)
+	if err != nil {
+		return nil, err
+	}
+
 	arrTable.Retain()
-	return &ArrowBackedTable{name: name, schema: schema, arrTable: arrTable}, nil
+	return &ArrowBackedTable{name: name, schema: schema, arrTable: arrTable, pm: pm}, nil
 }
 
 // Name implements sql.Table.
-// sql.Table インターフェースで要求される Name メソッドを実装し、テーブル名を返します。
 func (t *ArrowBackedTable) Name() string { return t.name }
 
 // String implements fmt.Stringer for debugging convenience.
-// fmt.Stringer を実装しており、デバッグ時にテーブル名を文字列として扱いやすくします。
 func (t *ArrowBackedTable) String() string { return t.name }
 
 // Schema implements sql.Table.
-// sql.Table の Schema メソッドを実装し、SQL 用のスキーマ情報を返します。
 func (t *ArrowBackedTable) Schema() sql.Schema { return t.schema }
 
 // Filters returns the filter expressions that will be pushed down into Arrow
@@ -67,8 +87,8 @@ func (t *ArrowBackedTable) Filters() []sql.Expression {
 	return out
 }
 
-// HandledFilters reports the subset of the supplied filters that ArrowBackedTable
-// knows how to evaluate with Arrow compute kernels.
+// HandledFilters reports the subset of the supplied filters that
+// ArrowBackedTable knows how to evaluate with Arrow compute kernels.
 func (t *ArrowBackedTable) HandledFilters(filters []sql.Expression) []sql.Expression {
 	var handled []sql.Expression
 	for _, f := range filters {
@@ -90,110 +110,206 @@ func (t *ArrowBackedTable) WithFilters(ctx *sql.Context, filters []sql.Expressio
 }
 
 type chunkPartition struct {
-	idx int
+	idx  int
+	meta *PartitionMeta
 }
 
 func (p *chunkPartition) Key() []byte {
-	// go-mysql-server ではパーティションの識別子をバイト列で返す必要があるため、チャンク番号を
-	// 32bit のビッグエンディアン整数としてエンコードします。これにより安定した順序付けが可能です。
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, uint32(p.idx))
 	return buf
 }
 
-// Partitions implements sql.Table. Each Arrow chunk becomes one partition.
-// Partitions は sql.Table の要件を満たし、各 Arrow チャンクを 1 つのパーティションとして扱います。
-// Arrow の列データが存在する場合はチャンク数を基準に、列がなく行数のみがある場合は
-// 論理的な行数に対応する 1 つのパーティションを用意することで、空行を返しつつ行数を保証します。
+// Partitions implements sql.Table. Each logical partition spans up to
+// PartitionSize rows and may be composed of multiple Arrow chunks.
 func (t *ArrowBackedTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
-	numChunks := 0
-	if t.arrTable.NumCols() > 0 {
-		numChunks = len(t.arrTable.Column(0).Data().Chunks())
-	} else if t.arrTable.NumRows() > 0 {
-		// Tables without columns can still report logical rows. Expose a
-		// single partition so that PartitionRows can return empty rows
-		// while honouring the reported row count.
-		numChunks = 1
-	}
-
-	if numChunks == 0 {
+	if t.pm == nil || len(t.pm.Parts) == 0 {
 		return sql.PartitionsToPartitionIter(), nil
 	}
 
-	parts := make([]sql.Partition, 0, numChunks)
-	for i := 0; i < numChunks; i++ {
-		parts = append(parts, &chunkPartition{idx: i})
+	parts := make([]sql.Partition, 0, len(t.pm.Parts))
+	for i, meta := range t.pm.Parts {
+		parts = append(parts, &chunkPartition{idx: i, meta: meta})
 	}
 	return sql.PartitionsToPartitionIter(parts...), nil
 }
 
-// PartitionRows implements sql.PartitionedTable.
-// sql.PartitionedTable の PartitionRows を実装し、指定されたパーティションに対応する
-// Arrow データから行イテレータを生成します。
+// PartitionRows implements sql.PartitionedTable. Each partition is materialised
+// into one or more Arrow records depending on how many chunk segments it spans.
+// Filters are pushed into Arrow compute when supported, otherwise the full
+// record slices are exposed to go-mysql-server for row-wise evaluation.
 func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
-	cp := p.(*chunkPartition)
-	if len(t.pushed) == 0 || t.arrTable.NumCols() == 0 {
-		// 指定されたパーティション（＝ Arrow のチャンク）に対応する行イテレータを生成します。
-		// newArrowRowIter はチャンク内の列配列を Retain し、呼び出し側の Close で解放する設計です。
-		return newArrowRowIter(t.arrTable, cp.idx), nil
+	cp, ok := p.(*chunkPartition)
+	if !ok {
+		return nil, fmt.Errorf("unexpected partition type %T", p)
 	}
-
-	rec := recordForChunk(t.arrTable, cp.idx)
-	if rec == nil {
+	meta := cp.meta
+	if meta == nil || meta.RowCount == 0 {
 		return sql.RowsToRowIter(), nil
 	}
-	defer rec.Release()
 
-	var goCtx context.Context = context.Background()
+	goCtx := context.Background()
 	if ctx != nil {
 		goCtx = ctx
 	}
 
-	mask, err := buildMaskForBatch(goCtx, rec, t.pushed)
-	if err != nil {
-		return nil, err
-	}
-	defer mask.Release()
-
-	opts := compute.FilterOptions{NullSelection: compute.SelectionDropNulls}
-	filtered, err := compute.FilterRecordBatch(goCtx, rec, mask, &opts)
-	if err != nil {
-		return nil, err
+	var iters []sql.RowIter
+	closeAll := func() {
+		for _, it := range iters {
+			_ = it.Close(ctx)
+		}
 	}
 
-	iter := newArrowRowIterFromRecord(filtered)
-	filtered.Release()
-	return iter, nil
+	for _, seg := range meta.Segments {
+		rec, err := t.sliceRecordForSegment(seg)
+		if err != nil {
+			closeAll()
+			return nil, err
+		}
+		if rec == nil || rec.NumRows() == 0 {
+			if rec != nil {
+				rec.Release()
+			}
+			continue
+		}
+
+		if len(t.pushed) == 0 || t.arrTable.NumCols() == 0 {
+			iter := newArrowRowIterFromRecord(rec)
+			rec.Release()
+			iters = append(iters, iter)
+			continue
+		}
+
+		mask, err := buildMaskForBatch(goCtx, rec, t.pushed)
+		if err != nil {
+			rec.Release()
+			closeAll()
+			return nil, err
+		}
+		opts := compute.FilterOptions{NullSelection: compute.SelectionDropNulls}
+		filtered, err := compute.FilterRecordBatch(goCtx, rec, mask, &opts)
+		mask.Release()
+		rec.Release()
+		if err != nil {
+			closeAll()
+			return nil, err
+		}
+		if filtered.NumRows() == 0 {
+			filtered.Release()
+			continue
+		}
+
+		iter := newArrowRowIterFromRecord(filtered)
+		filtered.Release()
+		iters = append(iters, iter)
+	}
+
+	return chainRowIters(iters), nil
 }
 
 // Collation implements sql.Table Collation support; Arrow arrays are
 // byte-oriented so we return the default collation.
-// Collation は sql.Table の照合順序サポートを実装します。Arrow 配列はバイト配列ベースで
-// 表現されるため、デフォルトの照合順序（Collation_Default）を返します。
 func (t *ArrowBackedTable) Collation() sql.CollationID {
 	return sql.Collation_Default
 }
 
-// recordForChunk materialises the requested chunk index into an Arrow record so
-// that compute kernels can operate on it. The returned record owns its column
-// references and must be released by the caller.
-func recordForChunk(tbl arrow.Table, chunkIdx int) arrow.Record {
-	if tbl == nil || tbl.NumCols() == 0 {
-		return nil
+func (t *ArrowBackedTable) sliceRecordForSegment(seg RowRange) (arrow.Record, error) {
+	if seg.Length == 0 {
+		return nil, nil
 	}
 
-	cols := make([]arrow.Array, int(tbl.NumCols()))
-	for i := range cols {
-		chunk := tbl.Column(i).Data().Chunk(chunkIdx)
-		chunk.Retain()
-		cols[i] = chunk
+	if t.arrTable == nil {
+		return nil, fmt.Errorf("no underlying Arrow table")
 	}
 
-	rec := array.NewRecord(tbl.Schema(), cols, -1)
+	if t.arrTable.NumCols() == 0 {
+		rec := array.NewRecord(t.arrTable.Schema(), nil, seg.Length)
+		return rec, nil
+	}
+
+	numCols := int(t.arrTable.NumCols())
+	cols := make([]arrow.Array, numCols)
+	for i := 0; i < numCols; i++ {
+		data := t.arrTable.Column(i).Data()
+		if seg.Chunk < 0 || seg.Chunk >= len(data.Chunks()) {
+			return nil, fmt.Errorf("segment chunk index out of range: chunk=%d col=%d", seg.Chunk, i)
+		}
+		chunk := data.Chunk(seg.Chunk)
+		clen := int64(chunk.Len())
+		if seg.Offset < 0 || seg.Offset+seg.Length > clen {
+			return nil, fmt.Errorf("segment slice out of bounds: chunk=%d len=%d want=[%d,%d)", seg.Chunk, chunk.Len(), seg.Offset, seg.Offset+seg.Length)
+		}
+		arr := array.NewSlice(chunk, seg.Offset, seg.Offset+seg.Length)
+		cols[i] = arr
+	}
+
+	rec := array.NewRecord(t.arrTable.Schema(), cols, seg.Length)
 	for _, col := range cols {
 		col.Release()
 	}
-	return rec
+	return rec, nil
+}
+
+func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
+	pm := &PartitionManager{}
+	rows := tbl.NumRows()
+	if rows == 0 {
+		return pm, nil
+	}
+
+	if tbl.NumCols() == 0 {
+		var idx int
+		var done int64
+		for done < rows {
+			take := int64(PartitionSize)
+			if remaining := rows - done; remaining < take {
+				take = remaining
+			}
+			pm.Parts = append(pm.Parts, &PartitionMeta{
+				Index:    idx,
+				RowCount: take,
+				Segments: []RowRange{{Chunk: 0, Offset: done, Length: take}},
+			})
+			idx++
+			done += take
+		}
+		return pm, nil
+	}
+
+	chunks := tbl.Column(0).Data().Chunks()
+	if len(chunks) == 0 {
+		return pm, nil
+	}
+
+	partIdx := 0
+	current := &PartitionMeta{Index: partIdx}
+	remaining := int64(PartitionSize)
+
+	for ci, chunk := range chunks {
+		clen := int64(chunk.Len())
+		off := int64(0)
+		for off < clen {
+			if remaining == 0 {
+				pm.Parts = append(pm.Parts, current)
+				partIdx++
+				current = &PartitionMeta{Index: partIdx}
+				remaining = PartitionSize
+			}
+			take := clen - off
+			if take > remaining {
+				take = remaining
+			}
+			current.Segments = append(current.Segments, RowRange{Chunk: ci, Offset: off, Length: take})
+			current.RowCount += take
+			off += take
+			remaining -= take
+		}
+	}
+
+	if current.RowCount > 0 {
+		pm.Parts = append(pm.Parts, current)
+	}
+	return pm, nil
 }
 
 func canHandleForCompute(e sql.Expression) bool {
@@ -203,7 +319,8 @@ func canHandleForCompute(e sql.Expression) bool {
 		*expression.GreaterThanOrEqual,
 		*expression.LessThan,
 		*expression.LessThanOrEqual:
-		return operandsSupported(ex.(expression.BinaryExpression))
+		be := ex.(expression.BinaryExpression)
+		return operandSupported(be.Left()) && operandSupported(be.Right())
 	case *expression.Between:
 		return operandSupported(ex.Val) && operandSupported(ex.Lower) && operandSupported(ex.Upper)
 	case *expression.And:
@@ -213,10 +330,6 @@ func canHandleForCompute(e sql.Expression) bool {
 	}
 }
 
-func operandsSupported(be expression.BinaryExpression) bool {
-	return operandSupported(be.Left()) && operandSupported(be.Right())
-}
-
 func operandSupported(e sql.Expression) bool {
 	switch e.(type) {
 	case *expression.GetField, *expression.Literal:
@@ -224,6 +337,44 @@ func operandSupported(e sql.Expression) bool {
 	default:
 		return false
 	}
+}
+
+type chainedIter struct {
+	iters []sql.RowIter
+	idx   int
+}
+
+func (c *chainedIter) Next(ctx *sql.Context) (sql.Row, error) {
+	for c.idx < len(c.iters) {
+		row, err := c.iters[c.idx].Next(ctx)
+		if err == nil {
+			return row, nil
+		}
+		if errors.Is(err, io.EOF) {
+			_ = c.iters[c.idx].Close(ctx)
+			c.idx++
+			continue
+		}
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (c *chainedIter) Close(ctx *sql.Context) error {
+	var firstErr error
+	for ; c.idx < len(c.iters); c.idx++ {
+		if err := c.iters[c.idx].Close(ctx); firstErr == nil && err != nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func chainRowIters(iters []sql.RowIter) sql.RowIter {
+	if len(iters) == 0 {
+		return sql.RowsToRowIter()
+	}
+	return &chainedIter{iters: iters}
 }
 
 var _ sql.FilteredTable = (*ArrowBackedTable)(nil)
