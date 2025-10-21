@@ -5,15 +5,11 @@ package arrowtable
 // にマッピングし、SQL 実行エンジンから効率的に行イテレーションできるようにしています。
 
 import (
-	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
-	"github.com/apache/arrow/go/v15/arrow/compute"
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"AutoNormDb/engine/arrowbackend"
@@ -149,63 +145,58 @@ func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql
 		return sql.RowsToRowIter(), nil
 	}
 
-	goCtx := context.Background()
-	if ctx != nil {
-		goCtx = ctx
+	src := &segmentRecordSource{table: t, segments: meta.Segments}
+	var plan arrowbackend.ExecPlan
+	if len(t.pushed) > 0 && t.arrTable != nil && t.arrTable.NumCols() > 0 {
+		plan = arrowbackend.NewStaticExecPlan(t.pushed)
+	}
+	return arrowbackend.NewArrowRowIter(src, plan, nil), nil
+}
+
+type segmentRecordSource struct {
+	table    *ArrowBackedTable
+	segments []RowRange
+	idx      int
+	current  arrow.Record
+	err      error
+}
+
+func (s *segmentRecordSource) Next() bool {
+	if s.current != nil {
+		s.current.Release()
+		s.current = nil
 	}
 
-	var iters []sql.RowIter
-	closeAll := func() {
-		for _, it := range iters {
-			_ = it.Close(ctx)
-		}
-	}
-
-	for _, seg := range meta.Segments {
-		rec, err := t.sliceRecordForSegment(seg)
+	for s.idx < len(s.segments) {
+		rec, err := s.table.sliceRecordForSegment(s.segments[s.idx])
+		s.idx++
 		if err != nil {
-			closeAll()
-			return nil, err
+			s.err = err
+			return false
 		}
-		if rec == nil || rec.NumRows() == 0 {
-			if rec != nil {
-				rec.Release()
-			}
+		if rec == nil {
 			continue
 		}
-
-		if len(t.pushed) == 0 || t.arrTable.NumCols() == 0 {
-			iter := NewArrowRowIterFromRecord(rec)
+		if rec.NumRows() == 0 {
 			rec.Release()
-			iters = append(iters, iter)
 			continue
 		}
-
-		mask, err := arrowbackend.BuildMaskForBatch(goCtx, rec, t.pushed)
-		if err != nil {
-			rec.Release()
-			closeAll()
-			return nil, err
-		}
-		opts := compute.FilterOptions{NullSelection: compute.SelectionDropNulls}
-		filtered, err := compute.FilterRecordBatch(goCtx, rec, mask, &opts)
-		mask.Release()
-		rec.Release()
-		if err != nil {
-			closeAll()
-			return nil, err
-		}
-		if filtered.NumRows() == 0 {
-			filtered.Release()
-			continue
-		}
-
-		iter := NewArrowRowIterFromRecord(filtered)
-		filtered.Release()
-		iters = append(iters, iter)
+		s.current = rec
+		return true
 	}
 
-	return chainRowIters(iters), nil
+	return false
+}
+
+func (s *segmentRecordSource) Record() arrow.Record { return s.current }
+
+func (s *segmentRecordSource) Err() error { return s.err }
+
+func (s *segmentRecordSource) Release() {
+	if s.current != nil {
+		s.current.Release()
+		s.current = nil
+	}
 }
 
 // Collation implements sql.Table Collation support; Arrow arrays are
@@ -311,44 +302,6 @@ func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
 		pm.Parts = append(pm.Parts, current)
 	}
 	return pm, nil
-}
-
-type chainedIter struct {
-	iters []sql.RowIter
-	idx   int
-}
-
-func (c *chainedIter) Next(ctx *sql.Context) (sql.Row, error) {
-	for c.idx < len(c.iters) {
-		row, err := c.iters[c.idx].Next(ctx)
-		if err == nil {
-			return row, nil
-		}
-		if errors.Is(err, io.EOF) {
-			_ = c.iters[c.idx].Close(ctx)
-			c.idx++
-			continue
-		}
-		return nil, err
-	}
-	return nil, io.EOF
-}
-
-func (c *chainedIter) Close(ctx *sql.Context) error {
-	var firstErr error
-	for ; c.idx < len(c.iters); c.idx++ {
-		if err := c.iters[c.idx].Close(ctx); firstErr == nil && err != nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-func chainRowIters(iters []sql.RowIter) sql.RowIter {
-	if len(iters) == 0 {
-		return sql.RowsToRowIter()
-	}
-	return &chainedIter{iters: iters}
 }
 
 var _ sql.FilteredTable = (*ArrowBackedTable)(nil)
