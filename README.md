@@ -46,7 +46,7 @@ ORDER BY request_count DESC;
 
 ## Parquet テーブルを直接操作する CLI デモ
 
-`cmd/demo/main.go` には、`data/` 配下の Parquet ファイルを検出して読み込み、SQL を 1 回実行する最小構成のデモが含まれています。テーブル登録には `parquettable.RegisterParquetTable` を利用し、必要な列・RowGroup だけを読み出します。
+`cmd/demo/main.go` には、`lake/` 配下の Parquet ファイルを検出して読み込み、SQL を 1 回実行する最小構成のデモが含まれています。テーブル登録には `parquettable.RegisterParquetTable` を利用し、必要な列・RowGroup だけを読み出します。
 
 テーブル一覧を確認するには次のコマンドを実行します。
 
@@ -54,10 +54,10 @@ ORDER BY request_count DESC;
 go run ./cmd/demo
 ```
 
-任意のクエリは `-q` フラグで指定できます。列投影とフィルタが効いていることを確認するサンプルは以下の通りです。
+任意のクエリは `-q` フラグで指定できます。`lake/` 以下のファイルパスをテーブル名として指定できるようになったため、Parquet ファイルを直接参照する例は以下の通りです（スラッシュを含む名前はバッククォートで囲みます）。
 
 ```bash
-go run ./cmd/demo -q "SELECT name, age FROM users WHERE age > 30 LIMIT 5;"
+go run ./cmd/demo -q "SELECT\n  status,\n  COUNT(*) AS request_count\nFROM `lake/dummy_web_logs.parquet`\nGROUP BY status\nORDER BY request_count DESC;"
 ```
 
 結果はタブ区切りで標準出力に表示されます。

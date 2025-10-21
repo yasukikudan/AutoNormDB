@@ -24,12 +24,12 @@ func main() {
 	db := parquettable.NewDatabase(dbName)
 	provider := memory.NewDBProvider(db)
 
-	matches, err := filepath.Glob(filepath.Join("data", "*.parquet"))
+	matches, err := filepath.Glob(filepath.Join("lake", "*.parquet"))
 	if err != nil {
 		log.Fatalf("glob parquet files: %v", err)
 	}
 	if len(matches) == 0 {
-		log.Fatalf("no parquet files found in %s", filepath.Join("data", "*.parquet"))
+		log.Fatalf("no parquet files found in %s", filepath.Join("lake", "*.parquet"))
 	}
 
 	for _, path := range matches {
@@ -39,6 +39,11 @@ func main() {
 		}
 		if err := parquettable.RegisterParquetTable(provider, dbName, tableName, path); err != nil {
 			log.Fatalf("register parquet table %s: %v", tableName, err)
+		}
+
+		relPath := filepath.ToSlash(path)
+		if err := parquettable.RegisterParquetTable(provider, dbName, relPath, path); err != nil {
+			log.Fatalf("register parquet table %s: %v", relPath, err)
 		}
 	}
 
