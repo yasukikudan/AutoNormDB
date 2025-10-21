@@ -6,21 +6,37 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/compute"
 	arrowmemory "github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet"
 	arrowfile "github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/metadata"
 	arrowpqarrow "github.com/apache/arrow/go/v15/parquet/pqarrow"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/shopspring/decimal"
 
 	"AutoNormDb/engine/arrowbackend"
 	"AutoNormDb/table/arrowtable"
 )
+
+const defaultParquetBatchSize int64 = 16384
+
+func parquetBatchSize() int64 {
+	if env := os.Getenv("AUTONORM_PARQUET_BATCH"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			return int64(v)
+		}
+	}
+	return defaultParquetBatchSize
+}
 
 // ParquetBackedTable exposes a Parquet file as a go-mysql-server table. Row
 // groups are mapped to partitions so that the engine can parallelise reads
@@ -54,7 +70,7 @@ func NewParquetBackedTable(name, path string) (*ParquetBackedTable, error) {
 	defer rdr.Close()
 
 	allocator := arrowmemory.NewGoAllocator()
-	props := arrowpqarrow.ArrowReadProperties{BatchSize: 4096}
+	props := arrowpqarrow.ArrowReadProperties{BatchSize: parquetBatchSize()}
 	fr, err := arrowpqarrow.NewFileReader(rdr, props, allocator)
 	if err != nil {
 		return nil, fmt.Errorf("construct pqarrow reader for %q: %w", abs, err)
@@ -169,6 +185,12 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 		return nil, fmt.Errorf("unexpected partition type %T", p)
 	}
 
+	filters := t.Filters()
+	constraints, unsat := buildColumnConstraints(filters)
+	if unsat {
+		return sql.RowsToRowIter(), nil
+	}
+
 	goCtx := context.Background()
 	if ctx != nil {
 		goCtx = ctx
@@ -180,7 +202,7 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 	}
 
 	allocator := arrowmemory.NewGoAllocator()
-	props := arrowpqarrow.ArrowReadProperties{BatchSize: 4096}
+	props := arrowpqarrow.ArrowReadProperties{BatchSize: parquetBatchSize()}
 	fr, err := arrowpqarrow.NewFileReader(rdr, props, allocator)
 	if err != nil {
 		rdr.Close()
@@ -193,7 +215,30 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 	}
 
 	var rowGroups []int
-	if !rp.all {
+	if len(constraints) > 0 && rdr.MetaData() != nil {
+		var candidates []int
+		if rp.all {
+			total := len(rdr.MetaData().GetRowGroups())
+			if total > 0 {
+				candidates = make([]int, total)
+				for i := range candidates {
+					candidates[i] = i
+				}
+			}
+		} else {
+			candidates = []int{rp.index}
+		}
+		if len(candidates) > 0 {
+			pruned := pruneRowGroups(rdr.MetaData(), t.columnLookup, candidates, constraints)
+			if len(pruned) == 0 {
+				rdr.Close()
+				return sql.RowsToRowIter(), nil
+			}
+			rowGroups = pruned
+		} else if !rp.all {
+			rowGroups = []int{rp.index}
+		}
+	} else if !rp.all {
 		rowGroups = []int{rp.index}
 	}
 
@@ -203,7 +248,7 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 		return nil, fmt.Errorf("create record reader for %q: %w", t.path, err)
 	}
 
-	return &parquetRowIter{reader: rr, file: rdr, filters: t.Filters()}, nil
+	return &parquetRowIter{reader: rr, file: rdr, filters: filters}, nil
 }
 
 // WithProjections implements sql.ProjectedTable. The returned copy remembers
@@ -248,7 +293,12 @@ type parquetRowIter struct {
 
 	current arrow.Record
 	row     int
+
+	getters []colGetter
+	rowBuf  []any
 }
+
+type colGetter func(row int) any
 
 func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	for {
@@ -260,6 +310,7 @@ func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			it.current.Release()
 			it.current = nil
 		}
+		it.getters = nil
 
 		if !it.reader.Next() {
 			if err := it.reader.Err(); err != nil && err != io.EOF {
@@ -291,6 +342,7 @@ func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 
 		it.current = rec
 		it.row = 0
+		it.getters = buildGetters(rec)
 	}
 }
 
@@ -315,17 +367,22 @@ func (it *parquetRowIter) applyFilters(ctx *sql.Context, rec arrow.Record) (arro
 }
 
 func (it *parquetRowIter) extractRow() (sql.Row, error) {
-	cols := int(it.current.NumCols())
-	row := make(sql.Row, cols)
-	for i := 0; i < cols; i++ {
-		col := it.current.Column(i)
-		if col.IsNull(it.row) {
-			row[i] = nil
+	if len(it.getters) == 0 {
+		it.row++
+		return sql.Row{}, nil
+	}
+	if len(it.rowBuf) != len(it.getters) {
+		it.rowBuf = make([]any, len(it.getters))
+	}
+	for i, getter := range it.getters {
+		if getter == nil {
+			it.rowBuf[i] = nil
 			continue
 		}
-		row[i] = valueAt(col, it.row)
+		it.rowBuf[i] = getter(it.row)
 	}
 	it.row++
+	row := append(make(sql.Row, 0, len(it.rowBuf)), it.rowBuf...)
 	return row, nil
 }
 
@@ -342,7 +399,208 @@ func (it *parquetRowIter) Close(*sql.Context) error {
 		_ = it.file.Close()
 		it.file = nil
 	}
+	it.getters = nil
+	it.rowBuf = nil
 	return nil
+}
+
+func buildGetters(rec arrow.Record) []colGetter {
+	cols := int(rec.NumCols())
+	getters := make([]colGetter, cols)
+	for i := 0; i < cols; i++ {
+		col := rec.Column(i)
+		switch arr := col.(type) {
+		case *array.Int8:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Int16:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Int32:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Int64:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Uint8:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int64(data.Value(r))
+			}
+		case *array.Uint16:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int64(data.Value(r))
+			}
+		case *array.Uint32:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int64(data.Value(r))
+			}
+		case *array.Uint64:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				v := data.Value(r)
+				if v > math.MaxInt64 {
+					return int64(math.MaxInt64)
+				}
+				return int64(v)
+			}
+		case *array.Float32:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Float64:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Boolean:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.String:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.LargeString:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return data.Value(r)
+			}
+		case *array.Binary:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return string(data.Value(r))
+			}
+		case *array.LargeBinary:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return string(data.Value(r))
+			}
+		case *array.FixedSizeBinary:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return string(data.Value(r))
+			}
+		case *array.Timestamp:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int64(data.Value(r))
+			}
+		case *array.Date32:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int32(data.Value(r))
+			}
+		case *array.Date64:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				return int64(data.Value(r))
+			}
+		case *array.Decimal128:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				if dt, ok := data.DataType().(*arrow.Decimal128Type); ok {
+					num := data.Value(r)
+					return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
+				}
+				return nil
+			}
+		case *array.Decimal256:
+			data := arr
+			getters[i] = func(r int) any {
+				if data.IsNull(r) {
+					return nil
+				}
+				if dt, ok := data.DataType().(*arrow.Decimal256Type); ok {
+					num := data.Value(r)
+					return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
+				}
+				return nil
+			}
+		default:
+			a := col
+			getters[i] = func(r int) any {
+				if a.IsNull(r) {
+					return nil
+				}
+				return valueAt(a, r)
+			}
+		}
+	}
+	return getters
 }
 
 func valueAt(col arrow.Array, idx int) any {
@@ -403,5 +661,434 @@ func valueAt(col arrow.Array, idx int) any {
 		return nil
 	default:
 		return nil
+	}
+}
+
+type compareOp int
+
+const (
+	compareOpEqual compareOp = iota
+	compareOpGreater
+	compareOpGreaterEqual
+	compareOpLess
+	compareOpLessEqual
+)
+
+type valueKind int
+
+const (
+	kindInvalid valueKind = iota
+	kindInt
+	kindFloat
+	kindString
+	kindBool
+)
+
+type comparableValue struct {
+	kind    valueKind
+	i64     int64
+	f64     float64
+	str     string
+	boolVal bool
+}
+
+func (v comparableValue) compare(other comparableValue) (int, bool) {
+	if v.kind != other.kind {
+		return 0, false
+	}
+	switch v.kind {
+	case kindInt:
+		switch {
+		case v.i64 < other.i64:
+			return -1, true
+		case v.i64 > other.i64:
+			return 1, true
+		default:
+			return 0, true
+		}
+	case kindFloat:
+		switch {
+		case v.f64 < other.f64:
+			return -1, true
+		case v.f64 > other.f64:
+			return 1, true
+		default:
+			return 0, true
+		}
+	case kindString:
+		return strings.Compare(v.str, other.str), true
+	case kindBool:
+		switch {
+		case !v.boolVal && other.boolVal:
+			return -1, true
+		case v.boolVal && !other.boolVal:
+			return 1, true
+		default:
+			return 0, true
+		}
+	default:
+		return 0, false
+	}
+}
+
+type columnConstraint struct {
+	min          *comparableValue
+	max          *comparableValue
+	minInclusive bool
+	maxInclusive bool
+	invalid      bool
+}
+
+func (c *columnConstraint) tightenMin(val comparableValue, inclusive bool) {
+	if c.invalid {
+		return
+	}
+	if c.min == nil {
+		v := val
+		c.min = &v
+		c.minInclusive = inclusive
+		return
+	}
+	cmp, ok := c.min.compare(val)
+	if !ok {
+		c.invalid = true
+		return
+	}
+	if cmp < 0 {
+		v := val
+		c.min = &v
+		c.minInclusive = inclusive
+	} else if cmp == 0 {
+		c.minInclusive = c.minInclusive && inclusive
+	}
+}
+
+func (c *columnConstraint) tightenMax(val comparableValue, inclusive bool) {
+	if c.invalid {
+		return
+	}
+	if c.max == nil {
+		v := val
+		c.max = &v
+		c.maxInclusive = inclusive
+		return
+	}
+	cmp, ok := c.max.compare(val)
+	if !ok {
+		c.invalid = true
+		return
+	}
+	if cmp > 0 {
+		v := val
+		c.max = &v
+		c.maxInclusive = inclusive
+	} else if cmp == 0 {
+		c.maxInclusive = c.maxInclusive && inclusive
+	}
+}
+
+func (c *columnConstraint) contradiction() bool {
+	if c.invalid {
+		return false
+	}
+	if c.min == nil || c.max == nil {
+		return false
+	}
+	cmp, ok := c.min.compare(*c.max)
+	if !ok {
+		return false
+	}
+	if cmp > 0 {
+		return true
+	}
+	if cmp == 0 && (!c.minInclusive || !c.maxInclusive) {
+		return true
+	}
+	return false
+}
+
+func makeComparable(v interface{}) (comparableValue, bool) {
+	switch val := v.(type) {
+	case int:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case int8:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case int16:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case int32:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case int64:
+		return comparableValue{kind: kindInt, i64: val}, true
+	case uint:
+		if uint64(val) > math.MaxInt64 {
+			return comparableValue{}, false
+		}
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case uint8:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case uint16:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case uint32:
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case uint64:
+		if val > math.MaxInt64 {
+			return comparableValue{}, false
+		}
+		return comparableValue{kind: kindInt, i64: int64(val)}, true
+	case float32:
+		if math.IsNaN(float64(val)) {
+			return comparableValue{}, false
+		}
+		return comparableValue{kind: kindFloat, f64: float64(val)}, true
+	case float64:
+		if math.IsNaN(val) {
+			return comparableValue{}, false
+		}
+		return comparableValue{kind: kindFloat, f64: val}, true
+	case string:
+		return comparableValue{kind: kindString, str: val}, true
+	case []byte:
+		return comparableValue{kind: kindString, str: string(val)}, true
+	case parquet.ByteArray:
+		return comparableValue{kind: kindString, str: string(val)}, true
+	case parquet.FixedLenByteArray:
+		return comparableValue{kind: kindString, str: string(val)}, true
+	case bool:
+		return comparableValue{kind: kindBool, boolVal: val}, true
+	default:
+		return comparableValue{}, false
+	}
+}
+
+func buildColumnConstraints(filters []sql.Expression) (map[string]*columnConstraint, bool) {
+	if len(filters) == 0 {
+		return nil, false
+	}
+	constraints := make(map[string]*columnConstraint)
+	var unsat bool
+	for _, f := range filters {
+		applyConstraintExpr(constraints, f, &unsat)
+		if unsat {
+			return nil, true
+		}
+	}
+	for name, c := range constraints {
+		if c == nil || c.invalid {
+			delete(constraints, name)
+		}
+	}
+	if len(constraints) == 0 {
+		return nil, false
+	}
+	return constraints, false
+}
+
+func applyConstraintExpr(constraints map[string]*columnConstraint, expr sql.Expression, unsat *bool) {
+	if *unsat {
+		return
+	}
+	switch e := expr.(type) {
+	case *expression.And:
+		applyConstraintExpr(constraints, e.LeftChild, unsat)
+		applyConstraintExpr(constraints, e.RightChild, unsat)
+	case *expression.Between:
+		field, ok := e.Val.(*expression.GetField)
+		if !ok {
+			return
+		}
+		column := strings.ToLower(field.Name())
+		constraint := ensureConstraint(constraints, column)
+		lower, lok := e.Lower.(*expression.Literal)
+		upper, uok := e.Upper.(*expression.Literal)
+		if lok {
+			if val, ok := makeComparable(lower.Value()); ok {
+				constraint.tightenMin(val, true)
+			} else {
+				constraint.invalid = true
+			}
+		}
+		if uok {
+			if val, ok := makeComparable(upper.Value()); ok {
+				constraint.tightenMax(val, true)
+			} else {
+				constraint.invalid = true
+			}
+		}
+		if constraint.contradiction() {
+			*unsat = true
+		}
+	case *expression.Equals:
+		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpEqual, unsat)
+	case *expression.GreaterThan:
+		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpGreater, unsat)
+	case *expression.GreaterThanOrEqual:
+		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpGreaterEqual, unsat)
+	case *expression.LessThan:
+		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpLess, unsat)
+	case *expression.LessThanOrEqual:
+		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpLessEqual, unsat)
+	}
+}
+
+func applyBinaryConstraint(constraints map[string]*columnConstraint, left, right sql.Expression, op compareOp, unsat *bool) {
+	if field, ok := left.(*expression.GetField); ok {
+		if lit, ok := right.(*expression.Literal); ok {
+			applyConstraintForField(constraints, strings.ToLower(field.Name()), lit.Value(), op, unsat)
+		}
+		return
+	}
+	if field, ok := right.(*expression.GetField); ok {
+		if lit, ok := left.(*expression.Literal); ok {
+			flipped := flipOp(op)
+			applyConstraintForField(constraints, strings.ToLower(field.Name()), lit.Value(), flipped, unsat)
+		}
+	}
+}
+
+func applyConstraintForField(constraints map[string]*columnConstraint, column string, raw interface{}, op compareOp, unsat *bool) {
+	constraint := ensureConstraint(constraints, column)
+	val, ok := makeComparable(raw)
+	if !ok {
+		constraint.invalid = true
+		return
+	}
+	switch op {
+	case compareOpEqual:
+		constraint.tightenMin(val, true)
+		constraint.tightenMax(val, true)
+	case compareOpGreater:
+		constraint.tightenMin(val, false)
+	case compareOpGreaterEqual:
+		constraint.tightenMin(val, true)
+	case compareOpLess:
+		constraint.tightenMax(val, false)
+	case compareOpLessEqual:
+		constraint.tightenMax(val, true)
+	}
+	if constraint.contradiction() {
+		*unsat = true
+	}
+}
+
+func flipOp(op compareOp) compareOp {
+	switch op {
+	case compareOpGreater:
+		return compareOpLess
+	case compareOpGreaterEqual:
+		return compareOpLessEqual
+	case compareOpLess:
+		return compareOpGreater
+	case compareOpLessEqual:
+		return compareOpGreaterEqual
+	default:
+		return compareOpEqual
+	}
+}
+
+func ensureConstraint(m map[string]*columnConstraint, column string) *columnConstraint {
+	c, ok := m[column]
+	if !ok {
+		c = &columnConstraint{}
+		m[column] = c
+	}
+	return c
+}
+
+func pruneRowGroups(meta *metadata.FileMetaData, lookup map[string]int, candidates []int, constraints map[string]*columnConstraint) []int {
+	if meta == nil || len(constraints) == 0 {
+		return candidates
+	}
+	out := make([]int, 0, len(candidates))
+	for _, idx := range candidates {
+		if idx < 0 || idx >= len(meta.GetRowGroups()) {
+			continue
+		}
+		rg := meta.RowGroup(idx)
+		if rowGroupMatches(rg, lookup, constraints) {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
+func rowGroupMatches(rg *metadata.RowGroupMetaData, lookup map[string]int, constraints map[string]*columnConstraint) bool {
+	for name, constraint := range constraints {
+		if constraint == nil {
+			continue
+		}
+		idx, ok := lookup[name]
+		if !ok {
+			continue
+		}
+		chunk, err := rg.ColumnChunk(idx)
+		if err != nil {
+			return true
+		}
+		stats, err := chunk.Statistics()
+		if err != nil || stats == nil || !stats.HasMinMax() {
+			continue
+		}
+		minVal, maxVal, ok := statMinMax(stats)
+		if !ok {
+			continue
+		}
+		if constraint.min != nil {
+			cmp, ok := maxVal.compare(*constraint.min)
+			if ok {
+				if cmp < 0 {
+					return false
+				}
+				if cmp == 0 && !constraint.minInclusive {
+					return false
+				}
+			}
+		}
+		if constraint.max != nil {
+			cmp, ok := minVal.compare(*constraint.max)
+			if ok {
+				if cmp > 0 {
+					return false
+				}
+				if cmp == 0 && !constraint.maxInclusive {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func statMinMax(stats metadata.TypedStatistics) (comparableValue, comparableValue, bool) {
+	switch s := stats.(type) {
+	case *metadata.Int32Statistics:
+		min, okMin := makeComparable(s.Min())
+		max, okMax := makeComparable(s.Max())
+		return min, max, okMin && okMax
+	case *metadata.Int64Statistics:
+		min, okMin := makeComparable(s.Min())
+		max, okMax := makeComparable(s.Max())
+		return min, max, okMin && okMax
+	case *metadata.Float32Statistics:
+		min, okMin := makeComparable(s.Min())
+		max, okMax := makeComparable(s.Max())
+		return min, max, okMin && okMax
+	case *metadata.Float64Statistics:
+		min, okMin := makeComparable(s.Min())
+		max, okMax := makeComparable(s.Max())
+		return min, max, okMin && okMax
+	case *metadata.BooleanStatistics:
+		min, okMin := makeComparable(s.Min())
+		max, okMax := makeComparable(s.Max())
+		return min, max, okMin && okMax
+	case *metadata.ByteArrayStatistics:
+		min, okMin := makeComparable([]byte(s.Min()))
+		max, okMax := makeComparable([]byte(s.Max()))
+		return min, max, okMin && okMax
+	case *metadata.FixedLenByteArrayStatistics:
+		min, okMin := makeComparable([]byte(s.Min()))
+		max, okMax := makeComparable([]byte(s.Max()))
+		return min, max, okMin && okMax
+	default:
+		return comparableValue{}, comparableValue{}, false
 	}
 }
