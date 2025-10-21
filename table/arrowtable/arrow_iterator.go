@@ -11,6 +11,7 @@ import (
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/shopspring/decimal"
 )
 
 type arrowRowIter struct {
@@ -136,6 +137,18 @@ func valueAt(col arrow.Array, idx int) any {
 		return int32(arr.Value(idx))
 	case *array.Date64:
 		return int64(arr.Value(idx))
+	case *array.Decimal128:
+		if dt, ok := arr.DataType().(*arrow.Decimal128Type); ok {
+			num := arr.Value(idx)
+			return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
+		}
+		return nil
+	case *array.Decimal256:
+		if dt, ok := arr.DataType().(*arrow.Decimal256Type); ok {
+			num := arr.Value(idx)
+			return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
+		}
+		return nil
 	default:
 		// 未対応型に遭遇した場合は nil を返し、呼び出し側で後続処理を検討できるようにします。
 		return nil
