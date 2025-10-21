@@ -175,7 +175,7 @@ func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql
 		}
 
 		if len(t.pushed) == 0 || t.arrTable.NumCols() == 0 {
-			iter := newArrowRowIterFromRecord(rec)
+			iter := NewArrowRowIterFromRecord(rec)
 			rec.Release()
 			iters = append(iters, iter)
 			continue
@@ -200,7 +200,7 @@ func (t *ArrowBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql
 			continue
 		}
 
-		iter := newArrowRowIterFromRecord(filtered)
+		iter := NewArrowRowIterFromRecord(filtered)
 		filtered.Release()
 		iters = append(iters, iter)
 	}
