@@ -3,16 +3,15 @@ package parquettable
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/apache/arrow/go/v15/arrow"
-	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/compute"
 	arrowmemory "github.com/apache/arrow/go/v15/arrow/memory"
 	"github.com/apache/arrow/go/v15/parquet"
@@ -21,7 +20,6 @@ import (
 	arrowpqarrow "github.com/apache/arrow/go/v15/parquet/pqarrow"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
-	"github.com/shopspring/decimal"
 
 	"AutoNormDb/engine/arrowbackend"
 	"AutoNormDb/table/arrowtable"
@@ -291,26 +289,23 @@ type parquetRowIter struct {
 	file    *arrowfile.Reader
 	filters []sql.Expression
 
-	current arrow.Record
-	row     int
-
-	getters []colGetter
-	rowBuf  []any
+	current sql.RowIter
 }
-
-type colGetter func(row int) any
 
 func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	for {
-		if it.current != nil && it.row < int(it.current.NumRows()) {
-			return it.extractRow()
-		}
-
 		if it.current != nil {
-			it.current.Release()
-			it.current = nil
+			row, err := it.current.Next(ctx)
+			if err == nil {
+				return row, nil
+			}
+			if errors.Is(err, io.EOF) {
+				_ = it.current.Close(ctx)
+				it.current = nil
+				continue
+			}
+			return nil, err
 		}
-		it.getters = nil
 
 		if !it.reader.Next() {
 			if err := it.reader.Err(); err != nil && err != io.EOF {
@@ -340,9 +335,9 @@ func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			rec = filtered
 		}
 
-		it.current = rec
-		it.row = 0
-		it.getters = buildGetters(rec)
+		iter := arrowtable.NewArrowRowIterFromRecord(rec)
+		rec.Release()
+		it.current = iter
 	}
 }
 
@@ -364,304 +359,6 @@ func (it *parquetRowIter) applyFilters(ctx *sql.Context, rec arrow.Record) (arro
 		return nil, err
 	}
 	return filtered, nil
-}
-
-func (it *parquetRowIter) extractRow() (sql.Row, error) {
-	if len(it.getters) == 0 {
-		it.row++
-		return sql.Row{}, nil
-	}
-	if len(it.rowBuf) != len(it.getters) {
-		it.rowBuf = make([]any, len(it.getters))
-	}
-	for i, getter := range it.getters {
-		if getter == nil {
-			it.rowBuf[i] = nil
-			continue
-		}
-		it.rowBuf[i] = getter(it.row)
-	}
-	it.row++
-	row := append(make(sql.Row, 0, len(it.rowBuf)), it.rowBuf...)
-	return row, nil
-}
-
-func (it *parquetRowIter) Close(*sql.Context) error {
-	if it.current != nil {
-		it.current.Release()
-		it.current = nil
-	}
-	if it.reader != nil {
-		it.reader.Release()
-		it.reader = nil
-	}
-	if it.file != nil {
-		_ = it.file.Close()
-		it.file = nil
-	}
-	it.getters = nil
-	it.rowBuf = nil
-	return nil
-}
-
-func buildGetters(rec arrow.Record) []colGetter {
-	cols := int(rec.NumCols())
-	getters := make([]colGetter, cols)
-	for i := 0; i < cols; i++ {
-		col := rec.Column(i)
-		switch arr := col.(type) {
-		case *array.Int8:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Int16:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Int32:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Int64:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Uint8:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int64(data.Value(r))
-			}
-		case *array.Uint16:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int64(data.Value(r))
-			}
-		case *array.Uint32:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int64(data.Value(r))
-			}
-		case *array.Uint64:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				v := data.Value(r)
-				if v > math.MaxInt64 {
-					return int64(math.MaxInt64)
-				}
-				return int64(v)
-			}
-		case *array.Float32:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Float64:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Boolean:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.String:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.LargeString:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return data.Value(r)
-			}
-		case *array.Binary:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return string(data.Value(r))
-			}
-		case *array.LargeBinary:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return string(data.Value(r))
-			}
-		case *array.FixedSizeBinary:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return string(data.Value(r))
-			}
-		case *array.Timestamp:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int64(data.Value(r))
-			}
-		case *array.Date32:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int32(data.Value(r))
-			}
-		case *array.Date64:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				return int64(data.Value(r))
-			}
-		case *array.Decimal128:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				if dt, ok := data.DataType().(*arrow.Decimal128Type); ok {
-					num := data.Value(r)
-					return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
-				}
-				return nil
-			}
-		case *array.Decimal256:
-			data := arr
-			getters[i] = func(r int) any {
-				if data.IsNull(r) {
-					return nil
-				}
-				if dt, ok := data.DataType().(*arrow.Decimal256Type); ok {
-					num := data.Value(r)
-					return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
-				}
-				return nil
-			}
-		default:
-			a := col
-			getters[i] = func(r int) any {
-				if a.IsNull(r) {
-					return nil
-				}
-				return valueAt(a, r)
-			}
-		}
-	}
-	return getters
-}
-
-func valueAt(col arrow.Array, idx int) any {
-	switch arr := col.(type) {
-	case *array.Int8:
-		return arr.Value(idx)
-	case *array.Int16:
-		return arr.Value(idx)
-	case *array.Int32:
-		return arr.Value(idx)
-	case *array.Int64:
-		return arr.Value(idx)
-	case *array.Uint8:
-		return int64(arr.Value(idx))
-	case *array.Uint16:
-		return int64(arr.Value(idx))
-	case *array.Uint32:
-		return int64(arr.Value(idx))
-	case *array.Uint64:
-		v := arr.Value(idx)
-		if v > math.MaxInt64 {
-			return int64(math.MaxInt64)
-		}
-		return int64(v)
-	case *array.Float32:
-		return arr.Value(idx)
-	case *array.Float64:
-		return arr.Value(idx)
-	case *array.Boolean:
-		return arr.Value(idx)
-	case *array.String:
-		return arr.Value(idx)
-	case *array.LargeString:
-		return arr.Value(idx)
-	case *array.Binary:
-		return string(arr.Value(idx))
-	case *array.LargeBinary:
-		return string(arr.Value(idx))
-	case *array.FixedSizeBinary:
-		return string(arr.Value(idx))
-	case *array.Timestamp:
-		return int64(arr.Value(idx))
-	case *array.Date32:
-		return int32(arr.Value(idx))
-	case *array.Date64:
-		return int64(arr.Value(idx))
-	case *array.Decimal128:
-		if dt, ok := arr.DataType().(*arrow.Decimal128Type); ok {
-			num := arr.Value(idx)
-			return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
-		}
-		return nil
-	case *array.Decimal256:
-		if dt, ok := arr.DataType().(*arrow.Decimal256Type); ok {
-			num := arr.Value(idx)
-			return decimal.NewFromBigInt(num.BigInt(), -dt.Scale)
-		}
-		return nil
-	default:
-		return nil
-	}
 }
 
 type compareOp int
