@@ -3,16 +3,14 @@ package parquettable
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/apache/arrow/go/v15/arrow"
-	"github.com/apache/arrow/go/v15/arrow/compute"
 	arrowmemory "github.com/apache/arrow/go/v15/arrow/memory"
 	"github.com/apache/arrow/go/v15/parquet"
 	arrowfile "github.com/apache/arrow/go/v15/parquet/file"
@@ -246,7 +244,54 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 		return nil, fmt.Errorf("create record reader for %q: %w", t.path, err)
 	}
 
-	return &parquetRowIter{reader: rr, file: rdr, filters: filters}, nil
+	src := &pqarrowRecordSource{reader: rr, file: rdr}
+	var plan arrowbackend.ExecPlan
+	if len(filters) > 0 && len(t.schema) > 0 {
+		plan = arrowbackend.NewStaticExecPlan(filters)
+	}
+	return arrowbackend.NewArrowRowIter(src, plan, nil), nil
+}
+
+type pqarrowRecordSource struct {
+	reader  arrowpqarrow.RecordReader
+	file    *arrowfile.Reader
+	current arrow.Record
+	err     error
+}
+
+func (s *pqarrowRecordSource) Next() bool {
+	if s.current != nil {
+		s.current.Release()
+		s.current = nil
+	}
+	if s.reader == nil {
+		return false
+	}
+	if !s.reader.Next() {
+		s.err = s.reader.Err()
+		return false
+	}
+	s.current = s.reader.Record()
+	return true
+}
+
+func (s *pqarrowRecordSource) Record() arrow.Record { return s.current }
+
+func (s *pqarrowRecordSource) Err() error { return s.err }
+
+func (s *pqarrowRecordSource) Release() {
+	if s.current != nil {
+		s.current.Release()
+		s.current = nil
+	}
+	if s.reader != nil {
+		s.reader.Release()
+		s.reader = nil
+	}
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
 }
 
 // WithProjections implements sql.ProjectedTable. The returned copy remembers
@@ -282,104 +327,6 @@ func (t *ParquetBackedTable) WithProjections(_ *sql.Context, columns []string) s
 	nt.projection = indices
 	nt.schema = projected
 	return &nt
-}
-
-type parquetRowIter struct {
-	reader  arrowpqarrow.RecordReader
-	file    *arrowfile.Reader
-	filters []sql.Expression
-
-	current sql.RowIter
-}
-
-func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
-	for {
-		if it.current != nil {
-			row, err := it.current.Next(ctx)
-			if err == nil {
-				return row, nil
-			}
-			if errors.Is(err, io.EOF) {
-				_ = it.current.Close(ctx)
-				it.current = nil
-				continue
-			}
-			return nil, err
-		}
-
-		if !it.reader.Next() {
-			if err := it.reader.Err(); err != nil && err != io.EOF {
-				return nil, err
-			}
-			return nil, io.EOF
-		}
-
-		rec := it.reader.Record()
-		if rec == nil || rec.NumRows() == 0 {
-			continue
-		}
-		rec.Retain()
-
-		if len(it.filters) > 0 && rec.NumCols() > 0 {
-			filtered, err := it.applyFilters(ctx, rec)
-			rec.Release()
-			if err != nil {
-				return nil, err
-			}
-			if filtered == nil || filtered.NumRows() == 0 {
-				if filtered != nil {
-					filtered.Release()
-				}
-				continue
-			}
-			rec = filtered
-		}
-
-		iter := arrowtable.NewArrowRowIterFromRecord(rec)
-		rec.Release()
-		it.current = iter
-	}
-}
-
-func (it *parquetRowIter) Close(ctx *sql.Context) error {
-	var err error
-	if it.current != nil {
-		if cerr := it.current.Close(ctx); err == nil {
-			err = cerr
-		}
-		it.current = nil
-	}
-	if it.reader != nil {
-		it.reader.Release()
-		it.reader = nil
-	}
-	if it.file != nil {
-		if ferr := it.file.Close(); err == nil {
-			err = ferr
-		}
-		it.file = nil
-	}
-	return err
-}
-
-func (it *parquetRowIter) applyFilters(ctx *sql.Context, rec arrow.Record) (arrow.Record, error) {
-	goCtx := context.Background()
-	if ctx != nil {
-		goCtx = ctx
-	}
-
-	mask, err := arrowbackend.BuildMaskForBatch(goCtx, rec, it.filters)
-	if err != nil {
-		return nil, err
-	}
-	defer mask.Release()
-
-	opts := compute.FilterOptions{NullSelection: compute.SelectionDropNulls}
-	filtered, err := compute.FilterRecordBatch(goCtx, rec, mask, &opts)
-	if err != nil {
-		return nil, err
-	}
-	return filtered, nil
 }
 
 type compareOp int
