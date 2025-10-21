@@ -1,18 +1,16 @@
 package main
 
-// このプログラムはローカルの "lake" ディレクトリに存在するすべての Parquet ファイルを
-// 読み込み、Parquet バックエンドのインメモリデータベースにロードしたうえで、go-mysql-server を
-// 利用した MySQL 互換サーバーとして公開します。処理の大まかな流れは (1) Parquet ファイルの
-// 探索、(2) Parquet テーブルとしての登録、(3) SQL サーバーの起動、という 3 段階です。
+// このプログラムはローカルの "lake" ディレクトリをデータレイクとして扱い、
+// FROM 句に指定されたファイルパスを動的に Arrow ベースのテーブルとして解決します。
+// go-mysql-server を利用した MySQL 互換サーバーを起動し、CLI と同じファイル解決
+// ロジックを共有することで、CUI と SQL クライアントのどちらからも一貫した操作性を提供します。
 
 import (
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
+	"time"
 
-	"AutoNormDb/internal/parquetfile"
+	"AutoNormDb/internal/arrowfile"
 	"AutoNormDb/sqlserver"
 )
 
@@ -23,42 +21,15 @@ var (
 )
 
 func main() {
-	// データレイクとして扱うディレクトリ名。実行時にはここから Parquet ファイルを探索します。
-	dataDir := "lake"
-
-	// ディレクトリ配下のエントリをすべて列挙し、ファイルのメタデータを取得します。
-	// ReadDir は一括で結果を返すため、後続のフィルタリング処理をメモリ上でまとめて実行できます。
-	entries, err := os.ReadDir(dataDir)
-	if err != nil {
-		log.Fatal(err)
+	cfg := arrowfile.ProviderConfig{
+		DatabaseName: dbName,
+		AllowedRoots: []string{"lake"},
+		EnableGlob:   true,
+		CacheEntries: 8,
+		CacheTTL:     time.Minute,
 	}
 
-	var parquetFiles []string
-	for _, entry := range entries {
-		// サブディレクトリはスキップし、最上位に存在するファイルのみを対象とします。
-		if entry.IsDir() {
-			continue
-		}
-
-		// 拡張子が .parquet かどうかを大小文字を無視して判定し、対象ファイルのパスを収集します。
-		// filepath.Ext は先頭にドットを含む拡張子を返すため、strings.EqualFold を使って比較します。
-		if strings.EqualFold(filepath.Ext(entry.Name()), ".parquet") {
-			parquetFiles = append(parquetFiles, filepath.Join(dataDir, entry.Name()))
-		}
-	}
-
-	// 一件も Parquet ファイルが見つからなかった場合は致命的エラーとして終了します。
-	if len(parquetFiles) == 0 {
-		log.Fatalf("no parquet files found in %s", dataDir)
-	}
-
-	// parquetfile.LoadParquetFilesIntoDB は全ファイルを読み込み、各ファイルを 1 テーブルとして
-	// Parquet バックエンドのデータベースに登録します。戻り値の provider は go-mysql-server への
-	// 接続口になります。
-	provider, err := parquetfile.LoadParquetFilesIntoDB(parquetFiles, dbName)
-	if err != nil {
-		log.Fatal(err)
-	}
+	provider := arrowfile.NewProvider(cfg)
 
 	// SQL サーバーを指定アドレスで起動します。Start 内部では非同期でサーバーループが開始されます。
 	if err := sqlserver.Start(provider, fmt.Sprintf("%s:%d", address, port)); err != nil {
