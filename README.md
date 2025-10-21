@@ -44,6 +44,24 @@ ORDER BY request_count DESC;
 
 読み込まれたテーブルを活用してデータセットの探索をお楽しみください。
 
+## Parquet テーブルを直接操作する CLI デモ
+
+`cmd/demo/main.go` には、`data/` 配下の Parquet ファイルを検出して読み込み、SQL を 1 回実行する最小構成のデモが含まれています。テーブル登録には `parquettable.RegisterParquetTable` を利用し、必要な列・RowGroup だけを読み出します。
+
+テーブル一覧を確認するには次のコマンドを実行します。
+
+```bash
+go run ./cmd/demo
+```
+
+任意のクエリは `-q` フラグで指定できます。列投影とフィルタが効いていることを確認するサンプルは以下の通りです。
+
+```bash
+go run ./cmd/demo -q "SELECT name, age FROM users WHERE age > 30 LIMIT 5;"
+```
+
+結果はタブ区切りで標準出力に表示されます。
+
 ## SQLTools での実行例
 VS Code の [SQLTools](https://marketplace.visualstudio.com/items?itemName=mtxr.sqltools) を利用すると、GUI 上でスキーマの確認やクエリの実行が行えます。
 
