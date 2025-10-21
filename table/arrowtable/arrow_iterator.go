@@ -39,7 +39,8 @@ func newArrowRowIter(tbl arrow.Table, chunkIdx int) sql.RowIter {
 	return &arrowRowIter{cols: cols, row: 0, n: cols[0].Len()}
 }
 
-func newArrowRowIterFromRecord(rec arrow.Record) sql.RowIter {
+// NewArrowRowIterFromRecord wraps a single Arrow record and exposes it as a sql.RowIter.
+func NewArrowRowIterFromRecord(rec arrow.Record) sql.RowIter {
 	if rec == nil {
 		return &arrowRowIter{cols: nil, row: 0, n: 0}
 	}
