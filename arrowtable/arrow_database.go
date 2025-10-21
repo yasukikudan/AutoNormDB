@@ -2,13 +2,13 @@ package arrowtable
 
 import "AutoNormDb/database"
 
-// Database is retained for backwards compatibility with existing Arrow table
-// callers. It simply aliases the shared database implementation so that Arrow
-// backed tables can coexist with other table types.
+// Database は既存の Arrow テーブル利用者との後方互換性のために公開される別名です。
+// 共通のデータベース実装を再利用し、Arrow バックエンドのパーティションが他形式と
+// 共存できるようにします。
 type Database = database.Database
 
-// NewDatabase constructs a database that can store Arrow-backed tables alongside
-// other sql.Table implementations.
+// NewDatabase は Arrow バックエンドのパーティションを他の実装と混在させられる
+// データベースを構築します。
 func NewDatabase(name string) *Database {
 	return database.NewDatabase(name)
 }

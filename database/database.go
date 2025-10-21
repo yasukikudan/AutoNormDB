@@ -9,83 +9,92 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
-// Database is a minimal read-only sql.Database implementation that can store
-// heterogeneous sql.Table implementations. Tables are keyed case-insensitively
-// so that callers can register arrow-backed, Parquet-backed, or other
-// go-mysql-server compatible tables under a single database instance.
+// Database は go-mysql-server の sql.Database を最小限に実装した読み取り専用の
+// データベースです。テーブルやその断片を「パーティション」と見なし、名前を
+// 大文字小文字を区別せずに管理することで、Arrow や Parquet など異なる実装を
+// 一つのデータベースに統合します。
 type Database struct {
-	name   string
-	mu     sync.RWMutex
-	tables map[string]sql.Table
+	name       string
+	mu         sync.RWMutex
+	partitions map[string]sql.Table
 }
 
-// NewDatabase constructs an empty Database with the given name.
+// NewDatabase は指定した名称を持つ空のデータベースを作成します。
 func NewDatabase(name string) *Database {
 	return &Database{
-		name:   name,
-		tables: make(map[string]sql.Table),
+		name:       name,
+		partitions: make(map[string]sql.Table),
 	}
 }
 
-// Name implements sql.Nameable.
+// Name は sql.Nameable を実装し、データベース名を返します。
 func (db *Database) Name() string { return db.name }
 
-// IsReadOnly reports that loader-created databases do not support mutation.
+// IsReadOnly はローダーが作成するデータベースが読み取り専用であることを示します。
 func (db *Database) IsReadOnly() bool { return true }
 
-// Tables returns a copy of the registered tables keyed by their original
-// names. It is primarily intended for test helpers.
-func (db *Database) Tables() map[string]sql.Table {
+// Partitions は登録されているパーティションを元の名称でコピーして返します。
+// テスト支援用であり、返却されたマップを変更しても内部状態には影響しません。
+func (db *Database) Partitions() map[string]sql.Table {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	out := make(map[string]sql.Table, len(db.tables))
-	for _, tbl := range db.tables {
+	out := make(map[string]sql.Table, len(db.partitions))
+	for _, tbl := range db.partitions {
 		out[tbl.Name()] = tbl
 	}
 	return out
 }
 
-// AddTable registers a new table with the database.
-func (db *Database) AddTable(t sql.Table) error {
+// Tables は後方互換性のために公開されるパーティション一覧の別名です。
+func (db *Database) Tables() map[string]sql.Table { return db.Partitions() }
+
+// AddPartition はパーティション（テーブル）を登録します。名称は大文字小文字を
+// 区別せずに保持され、同名のパーティションが既に存在する場合はエラーになります。
+func (db *Database) AddPartition(t sql.Table) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	key := strings.ToLower(t.Name())
-	if _, ok := db.tables[key]; ok {
+	if _, ok := db.partitions[key]; ok {
 		return sql.ErrTableAlreadyExists.New(t.Name())
 	}
-	db.tables[key] = t
+	db.partitions[key] = t
 	return nil
 }
 
-// MustAddTable registers the table and panics if a table with the same name is
-// already present.
-func (db *Database) MustAddTable(t sql.Table) {
-	if err := db.AddTable(t); err != nil {
-		panic(fmt.Errorf("add table %s: %w", t.Name(), err))
+// AddTable は後方互換性のために提供されるラッパーで、AddPartition を呼び出します。
+func (db *Database) AddTable(t sql.Table) error { return db.AddPartition(t) }
+
+// MustAddPartition はパーティションを登録し、失敗した場合は panic します。
+func (db *Database) MustAddPartition(t sql.Table) {
+	if err := db.AddPartition(t); err != nil {
+		panic(fmt.Errorf("add partition %s: %w", t.Name(), err))
 	}
 }
 
-// GetTableInsensitive implements sql.Database.
+// MustAddTable は後方互換性のために提供されるラッパーで、MustAddPartition を呼び出します。
+func (db *Database) MustAddTable(t sql.Table) { db.MustAddPartition(t) }
+
+// GetTableInsensitive は名称を大文字小文字を区別せずに解決し、該当するパーティションを返します。
 func (db *Database) GetTableInsensitive(_ *sql.Context, tblName string) (sql.Table, bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	tbl, ok := db.tables[strings.ToLower(tblName)]
+	tbl, ok := db.partitions[strings.ToLower(tblName)]
 	if !ok {
 		return nil, false, nil
 	}
 	return tbl, true, nil
 }
 
-// GetTableNames implements sql.Database.
+// GetTableNames は登録済みパーティションの名称を昇順で返します。
 func (db *Database) GetTableNames(*sql.Context) ([]string, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	names := make([]string, 0, len(db.tables))
-	for _, tbl := range db.tables {
+	names := make([]string, 0, len(db.partitions))
+	for _, tbl := range db.partitions {
 		names = append(names, tbl.Name())
 	}
 	sort.Strings(names)
