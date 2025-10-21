@@ -1,4 +1,4 @@
-package parquetloader
+package parquetfile
 
 // このパッケージは Parquet ファイルを go-mysql-server から直接参照可能な
 // ParquetBackedTable として登録するローダー処理を提供します。Parquet を Arrow
@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"AutoNormDb/database"
-	"AutoNormDb/parquettable"
+	"AutoNormDb/table/parquettable"
 )
 
 // LoadParquetIntoDB registers the given Parquet file as a table within a new

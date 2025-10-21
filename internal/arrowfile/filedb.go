@@ -12,7 +12,7 @@ import (
 	"github.com/apache/arrow/go/v15/arrow/memory"
 	"github.com/dolthub/go-mysql-server/sql"
 
-	"AutoNormDb/arrowtable"
+	"AutoNormDb/table/arrowtable"
 )
 
 // FileDatabase resolves table names to filesystem paths or glob patterns and

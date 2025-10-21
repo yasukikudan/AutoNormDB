@@ -12,7 +12,7 @@ import (
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
 
-	"AutoNormDb/parquettable"
+	"AutoNormDb/table/parquettable"
 )
 
 func main() {

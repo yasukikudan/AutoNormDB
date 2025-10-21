@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"AutoNormDb/parquetloader"
+	"AutoNormDb/internal/parquetfile"
 	"AutoNormDb/sqlserver"
 )
 
@@ -52,10 +52,10 @@ func main() {
 		log.Fatalf("no parquet files found in %s", dataDir)
 	}
 
-	// parquetloader.LoadParquetFilesIntoDB は全ファイルを読み込み、各ファイルを 1 テーブルとして
+	// parquetfile.LoadParquetFilesIntoDB は全ファイルを読み込み、各ファイルを 1 テーブルとして
 	// Parquet バックエンドのデータベースに登録します。戻り値の provider は go-mysql-server への
 	// 接続口になります。
-	provider, err := parquetloader.LoadParquetFilesIntoDB(parquetFiles, dbName)
+	provider, err := parquetfile.LoadParquetFilesIntoDB(parquetFiles, dbName)
 	if err != nil {
 		log.Fatal(err)
 	}
