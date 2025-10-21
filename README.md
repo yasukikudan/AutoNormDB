@@ -57,7 +57,7 @@ go run ./cmd/demo
 任意のクエリは `-q` フラグで指定できます。`lake/` 以下のファイルパスをテーブル名として指定できるようになったため、Parquet ファイルを直接参照する例は以下の通りです（スラッシュを含む名前はバッククォートで囲みます）。
 
 ```bash
-go run ./cmd/demo -q "SELECT\n  status,\n  COUNT(*) AS request_count\nFROM `lake/dummy_web_logs.parquet`\nGROUP BY status\nORDER BY request_count DESC;"
+go run ./cmd/demo -q "SELECT   status,  COUNT(*) AS request_count FROM `lake/dummy_web_logs.parquet` GROUP BY status ORDER BY request_count DESC;"
 ```
 
 結果はタブ区切りで標準出力に表示されます。
