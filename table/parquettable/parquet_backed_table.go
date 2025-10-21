@@ -27,7 +27,7 @@ import (
 	"AutoNormDb/table/arrowtable"
 )
 
-const defaultParquetBatchSize int64 = 16384
+const defaultParquetBatchSize int64 = 1 << 16 // 65536 rows per batch for higher throughput
 
 func parquetBatchSize() int64 {
 	if env := os.Getenv("AUTONORM_PARQUET_BATCH"); env != "" {
