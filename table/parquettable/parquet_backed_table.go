@@ -341,6 +341,27 @@ func (it *parquetRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	}
 }
 
+func (it *parquetRowIter) Close(ctx *sql.Context) error {
+	var err error
+	if it.current != nil {
+		if cerr := it.current.Close(ctx); err == nil {
+			err = cerr
+		}
+		it.current = nil
+	}
+	if it.reader != nil {
+		it.reader.Release()
+		it.reader = nil
+	}
+	if it.file != nil {
+		if ferr := it.file.Close(); err == nil {
+			err = ferr
+		}
+		it.file = nil
+	}
+	return err
+}
+
 func (it *parquetRowIter) applyFilters(ctx *sql.Context, rec arrow.Record) (arrow.Record, error) {
 	goCtx := context.Background()
 	if ctx != nil {
