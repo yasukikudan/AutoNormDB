@@ -17,8 +17,8 @@ import (
 	arrowpqarrow "github.com/apache/arrow/go/v15/parquet/pqarrow"
 	"github.com/dolthub/go-mysql-server/sql"
 
-	"AutoNormDb/arrowtable"
 	"AutoNormDb/engine/arrowbackend"
+	"AutoNormDb/table/arrowtable"
 )
 
 // ParquetBackedTable exposes a Parquet file as a go-mysql-server table. Row
