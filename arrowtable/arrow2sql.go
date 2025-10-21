@@ -42,7 +42,7 @@ func ArrowSchemaToSQLSchema(s *arrow.Schema, source string) (sql.Schema, error) 
 func arrowFieldToSQLType(f arrow.Field) (sql.Type, error) {
 	// Arrow のデータ型を go-mysql-server の型にマッピングします。MySQL 側でサポートの薄い
 	// 型はより広い互換型（例: 文字列は LongText）へフォールバックしています。
-	switch f.Type.(type) {
+	switch dt := f.Type.(type) {
 	case *arrow.Int8Type, *arrow.Uint8Type:
 		return types.Int8, nil
 	case *arrow.Int16Type, *arrow.Uint16Type:
@@ -61,9 +61,31 @@ func arrowFieldToSQLType(f arrow.Field) (sql.Type, error) {
 		return types.LongText, nil
 	case *arrow.BinaryType, *arrow.LargeBinaryType, *arrow.FixedSizeBinaryType:
 		return types.LongBlob, nil
+	case *arrow.Decimal128Type:
+		return arrowDecimalToSQLType(f.Name, dt.Precision, dt.Scale)
+	case *arrow.Decimal256Type:
+		return arrowDecimalToSQLType(f.Name, dt.Precision, dt.Scale)
 	default:
 		// マッピング表に存在しない型に遭遇した場合はエラーとして返し、呼び出し元で
 		// 適切な対処（例えばスキップやカスタム変換）を行ってもらいます。
 		return nil, fmt.Errorf("unsupported Arrow type for column %q: %s", f.Name, f.Type)
 	}
+}
+
+const maxUint8Value = int32(^uint8(0))
+
+func arrowDecimalToSQLType(column string, precision, scale int32) (sql.Type, error) {
+	if precision < 0 || scale < 0 {
+		return nil, fmt.Errorf("invalid decimal definition for column %q: precision=%d scale=%d", column, precision, scale)
+	}
+	if precision > maxUint8Value || scale > maxUint8Value {
+		return nil, fmt.Errorf("decimal precision/scale for column %q exceeds supported range: precision=%d scale=%d", column, precision, scale)
+	}
+
+	decType, err := types.CreateDecimalType(uint8(precision), uint8(scale))
+	if err != nil {
+		return nil, fmt.Errorf("unsupported decimal definition for column %q: %w", column, err)
+	}
+
+	return decType, nil
 }
