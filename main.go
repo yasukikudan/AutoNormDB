@@ -1,9 +1,9 @@
 package main
 
 // このプログラムはローカルの "lake" ディレクトリに存在するすべての Parquet ファイルを
-// 読み込み、Arrow ベースのインメモリデータベースにロードしたうえで、go-mysql-server を
+// 読み込み、Parquet バックエンドのインメモリデータベースにロードしたうえで、go-mysql-server を
 // 利用した MySQL 互換サーバーとして公開します。処理の大まかな流れは (1) Parquet ファイルの
-// 探索、(2) Arrow テーブルへの変換とデータベース化、(3) SQL サーバーの起動、という 3 段階です。
+// 探索、(2) Parquet テーブルとしての登録、(3) SQL サーバーの起動、という 3 段階です。
 
 import (
 	"fmt"
@@ -53,7 +53,8 @@ func main() {
 	}
 
 	// parquetloader.LoadParquetFilesIntoDB は全ファイルを読み込み、各ファイルを 1 テーブルとして
-	// Arrow ベースのデータベースに登録します。戻り値の provider は go-mysql-server への接続口になります。
+	// Parquet バックエンドのデータベースに登録します。戻り値の provider は go-mysql-server への
+	// 接続口になります。
 	provider, err := parquetloader.LoadParquetFilesIntoDB(parquetFiles, dbName)
 	if err != nil {
 		log.Fatal(err)
