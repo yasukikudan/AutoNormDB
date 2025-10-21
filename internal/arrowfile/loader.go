@@ -91,26 +91,29 @@ func loadFeather(path string, pool memory.Allocator) (arrow.Table, error) {
 	}
 	defer f.Close()
 
-	reader, err := ipc.NewFileReader(f)
+	reader, err := ipc.NewFileReader(f, ipc.WithAllocator(pool))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read feather: %w", err)
 	}
-	defer reader.Release()
+	defer reader.Close()
 
 	schema := reader.Schema()
 	if schema == nil {
 		return nil, fmt.Errorf("failed to read feather: empty schema")
 	}
 
-	var records []arrow.Record
-	for reader.Next() {
-		rec := reader.Record()
+	records := make([]arrow.Record, 0, reader.NumRecords())
+	for i := 0; i < reader.NumRecords(); i++ {
+		rec, err := reader.Record(i)
+		if err != nil {
+			releaseRecords(records)
+			return nil, fmt.Errorf("failed to read feather: %w", err)
+		}
+		if rec == nil {
+			continue
+		}
 		rec.Retain()
 		records = append(records, rec)
-	}
-	if err := reader.Err(); err != nil {
-		releaseRecords(records)
-		return nil, fmt.Errorf("failed to read feather: %w", err)
 	}
 
 	table := array.NewTableFromRecords(schema, records)
@@ -125,27 +128,18 @@ func concatTables(tables []arrow.Table) (arrow.Table, error) {
 
 	schema := tables[0].Schema()
 	for i := 1; i < len(tables); i++ {
-		if !arrow.SchemaEqual(schema, tables[i].Schema()) {
+		if !schema.Equal(tables[i].Schema()) {
 			return nil, fmt.Errorf("incompatible schemas across files")
 		}
 	}
 
 	var records []arrow.Record
 	for _, tbl := range tables {
-		reader, err := array.NewTableReader(tbl, math.MaxInt32)
-		if err != nil {
-			releaseRecords(records)
-			return nil, err
-		}
+		reader := array.NewTableReader(tbl, math.MaxInt64)
 		for reader.Next() {
 			rec := reader.Record()
 			rec.Retain()
 			records = append(records, rec)
-		}
-		if err := reader.Err(); err != nil {
-			reader.Release()
-			releaseRecords(records)
-			return nil, err
 		}
 		reader.Release()
 	}
