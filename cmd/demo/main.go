@@ -40,22 +40,30 @@ func main() {
 		if err := parquettable.RegisterParquetTable(provider, dbName, tableName, path); err != nil {
 			log.Fatalf("register parquet table %s: %v", tableName, err)
 		}
-
-		relPath := filepath.ToSlash(path)
-		if err := parquettable.RegisterParquetTable(provider, dbName, relPath, path); err != nil {
-			log.Fatalf("register parquet table %s: %v", relPath, err)
-		}
 	}
 
 	engine := sqle.NewDefault(provider)
 	ctx := sql.NewEmptyContext()
+	ctx.SetCurrentDatabase(dbName)
 
 	if *query == "" {
 		listTables(ctx, provider, dbName)
 		return
 	}
 
-	runQuery(ctx, engine, *query)
+	rewritten, paths := rewriteParquetReferences(*query)
+	if len(paths) > 0 {
+		for _, ref := range paths {
+			normalized := normalizeParquetPath(ref)
+			if err := parquettable.RegisterParquetTable(provider, dbName, ref, normalized); err != nil {
+				if !sql.ErrTableAlreadyExists.Is(err) {
+					log.Fatalf("register parquet table %s: %v", ref, err)
+				}
+			}
+		}
+	}
+
+	runQuery(ctx, engine, rewritten)
 }
 
 func listTables(ctx *sql.Context, provider *memory.DbProvider, dbName string) {
