@@ -38,6 +38,7 @@ type ArrowRowIter struct {
 	plan    ExecPlan
 	current arrow.Record
 	getters []colGetter
+	rowBuf  sql.Row
 
 	selIdxs []int
 	pos     int
@@ -49,7 +50,7 @@ type ArrowRowIterOpts struct{}
 // NewArrowRowIter constructs an ArrowRowIter for the provided record source and
 // optional execution plan.
 func NewArrowRowIter(src RecordSource, plan ExecPlan, _ *ArrowRowIterOpts) *ArrowRowIter {
-	return &ArrowRowIter{src: src, plan: plan}
+	return &ArrowRowIter{src: src, plan: plan, rowBuf: make(sql.Row, 0)}
 }
 
 // Next implements sql.RowIter. It materialises one row at a time from the
@@ -64,7 +65,7 @@ func (it *ArrowRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 		if it.current != nil && it.pos < len(it.selIdxs) {
 			idx := it.selIdxs[it.pos]
 			it.pos++
-			row := make(sql.Row, len(it.getters))
+			row := it.rowBuf
 			for i, getter := range it.getters {
 				row[i] = getter(idx)
 			}
@@ -75,6 +76,7 @@ func (it *ArrowRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			it.current.Release()
 			it.current = nil
 			it.getters = nil
+			it.rowBuf = it.rowBuf[:0]
 			it.selIdxs = it.selIdxs[:0]
 			it.pos = 0
 		}
@@ -93,7 +95,7 @@ func (it *ArrowRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 
 		rec.Retain()
 		it.current = rec
-		it.getters = buildGetters(rec)
+		it.rebuildGetters(rec)
 
 		if err := it.prepareSelection(goCtx); err != nil {
 			return nil, err
@@ -119,6 +121,7 @@ func (it *ArrowRowIter) Close(*sql.Context) error {
 		it.src = nil
 	}
 	it.getters = nil
+	it.rowBuf = it.rowBuf[:0]
 	it.selIdxs = nil
 	it.pos = 0
 	return nil
@@ -161,7 +164,7 @@ func (it *ArrowRowIter) prepareSelection(ctx context.Context) error {
 		}
 		it.current.Release()
 		it.current = filtered
-		it.getters = buildGetters(it.current)
+		it.rebuildGetters(it.current)
 		it.setAllRows(int(it.current.NumRows()))
 		return nil
 	}
@@ -196,17 +199,21 @@ func (it *ArrowRowIter) prepareSelection(ctx context.Context) error {
 		}
 		it.current.Release()
 		it.current = filtered
-		it.getters = buildGetters(it.current)
+		it.rebuildGetters(it.current)
 		it.setAllRows(int(it.current.NumRows()))
 		return nil
 	}
 
 	it.ensureIndexCap(selected)
+	sel := it.selIdxs[:selected]
+	idx := 0
 	for i := 0; i < length; i++ {
 		if !boolMask.IsNull(i) && boolMask.Value(i) {
-			it.selIdxs = append(it.selIdxs, i)
+			sel[idx] = i
+			idx++
 		}
 	}
+	it.selIdxs = sel[:idx]
 	mask.Release()
 	it.pos = 0
 	return nil
@@ -214,9 +221,11 @@ func (it *ArrowRowIter) prepareSelection(ctx context.Context) error {
 
 func (it *ArrowRowIter) setAllRows(n int) {
 	it.ensureIndexCap(n)
-	for i := 0; i < n; i++ {
-		it.selIdxs = append(it.selIdxs, i)
+	sel := it.selIdxs[:n]
+	for i := range sel {
+		sel[i] = i
 	}
+	it.selIdxs = sel
 	it.pos = 0
 }
 
@@ -230,68 +239,91 @@ func (it *ArrowRowIter) ensureIndexCap(n int) {
 
 type colGetter func(row int) any
 
-func buildGetters(rec arrow.Record) []colGetter {
-	n := int(rec.NumCols())
-	getters := make([]colGetter, n)
-	for i := 0; i < n; i++ {
-		switch col := rec.Column(i).(type) {
-		case *array.Int32:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				return col.Value(r)
+func (it *ArrowRowIter) rebuildGetters(rec arrow.Record) {
+	numCols := int(rec.NumCols())
+	if cap(it.getters) < numCols {
+		it.getters = make([]colGetter, numCols)
+	}
+	it.getters = it.getters[:numCols]
+	for i := 0; i < numCols; i++ {
+		it.getters[i] = makeGetter(rec.Column(i))
+	}
+	it.ensureRowBuf(numCols)
+}
+
+func (it *ArrowRowIter) ensureRowBuf(n int) {
+	if n == 0 {
+		if it.rowBuf == nil {
+			it.rowBuf = make(sql.Row, 0)
+			return
+		}
+		it.rowBuf = it.rowBuf[:0]
+		return
+	}
+	if cap(it.rowBuf) < n {
+		it.rowBuf = make(sql.Row, n)
+		return
+	}
+	it.rowBuf = it.rowBuf[:n]
+}
+
+func makeGetter(col arrow.Array) colGetter {
+	switch c := col.(type) {
+	case *array.Int32:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
-		case *array.Int64:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				return col.Value(r)
+			return c.Value(r)
+		}
+	case *array.Int64:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
-		case *array.Uint64:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				v := col.Value(r)
-				if v > math.MaxInt64 {
-					return int64(math.MaxInt64)
-				}
-				return int64(v)
+			return c.Value(r)
+		}
+	case *array.Uint64:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
-		case *array.Float64:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				return col.Value(r)
+			v := c.Value(r)
+			if v > math.MaxInt64 {
+				return int64(math.MaxInt64)
 			}
-		case *array.String:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				return col.Value(r)
+			return int64(v)
+		}
+	case *array.Float64:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
-		case *array.Boolean:
-			getters[i] = func(r int) any {
-				if col.IsNull(r) {
-					return nil
-				}
-				return col.Value(r)
+			return c.Value(r)
+		}
+	case *array.String:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
-		default:
-			column := rec.Column(i)
-			getters[i] = func(r int) any {
-				if column.IsNull(r) {
-					return nil
-				}
-				return defaultValueAt(column, r)
+			return c.Value(r)
+		}
+	case *array.Boolean:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
 			}
+			return c.Value(r)
+		}
+	default:
+		generic := col
+		return func(r int) any {
+			if generic.IsNull(r) {
+				return nil
+			}
+			return defaultValueAt(generic, r)
 		}
 	}
-	return getters
 }
 
 func defaultValueAt(col arrow.Array, idx int) any {
