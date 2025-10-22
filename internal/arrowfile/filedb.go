@@ -13,6 +13,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"AutoNormDb/table/arrowtable"
+	"AutoNormDb/table/parquettable"
 )
 
 // FileDatabase resolves table names to filesystem paths or glob patterns and
@@ -79,6 +80,14 @@ func (db *FileDatabase) GetTableInsensitive(ctx *sql.Context, name string) (sql.
 	sort.Strings(normalized)
 
 	key := cacheKeyFromPaths(normalized)
+	if len(normalized) == 1 && strings.EqualFold(filepath.Ext(normalized[0]), ".parquet") {
+		tbl, err := parquettable.NewParquetBackedTable(raw, normalized[0])
+		if err != nil {
+			return nil, false, err
+		}
+		return tbl, true, nil
+	}
+
 	if tbl, ok := db.Cache.Get(key); ok {
 		wrapped, err := arrowtable.NewArrowBackedTable(raw, tbl)
 		tbl.Release()
