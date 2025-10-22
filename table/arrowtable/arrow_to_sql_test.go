@@ -47,3 +47,37 @@ func TestArrowSchemaToSQLSchemaDecimal(t *testing.T) {
 		t.Fatalf("expected decimal type %s, got %s", expected.String(), dec.String())
 	}
 }
+
+func TestArrowSchemaToSQLSchemaUnsignedIntegers(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "u8", Type: arrow.PrimitiveTypes.Uint8},
+		{Name: "u16", Type: arrow.PrimitiveTypes.Uint16},
+		{Name: "u32", Type: arrow.PrimitiveTypes.Uint32},
+		{Name: "u64", Type: arrow.PrimitiveTypes.Uint64},
+	}, nil)
+
+	cols, err := ArrowSchemaToSQLSchema(schema, "nums")
+	if err != nil {
+		t.Fatalf("ArrowSchemaToSQLSchema error: %v", err)
+	}
+
+	if len(cols) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(cols))
+	}
+
+	cases := []struct {
+		idx int
+		typ sql.Type
+	}{
+		{0, types.Uint8},
+		{1, types.Uint16},
+		{2, types.Uint32},
+		{3, types.Uint64},
+	}
+
+	for _, tc := range cases {
+		if cols[tc.idx].Type != tc.typ {
+			t.Fatalf("column %d expected type %T, got %T", tc.idx, tc.typ, cols[tc.idx].Type)
+		}
+	}
+}

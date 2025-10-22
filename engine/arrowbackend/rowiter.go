@@ -3,7 +3,6 @@ package arrowbackend
 import (
 	"context"
 	"io"
-	"math"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -269,7 +268,42 @@ func (it *ArrowRowIter) ensureRowBuf(n int) {
 
 func makeGetter(col arrow.Array) colGetter {
 	switch c := col.(type) {
+	case *array.Int8:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
+			}
+			return int8(c.Value(r))
+		}
+	case *array.Uint8:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
+			}
+			return uint8(c.Value(r))
+		}
+	case *array.Int16:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
+			}
+			return int16(c.Value(r))
+		}
+	case *array.Uint16:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
+			}
+			return uint16(c.Value(r))
+		}
 	case *array.Int32:
+		return func(r int) any {
+			if c.IsNull(r) {
+				return nil
+			}
+			return c.Value(r)
+		}
+	case *array.Uint32:
 		return func(r int) any {
 			if c.IsNull(r) {
 				return nil
@@ -288,11 +322,7 @@ func makeGetter(col arrow.Array) colGetter {
 			if c.IsNull(r) {
 				return nil
 			}
-			v := c.Value(r)
-			if v > math.MaxInt64 {
-				return int64(math.MaxInt64)
-			}
-			return int64(v)
+			return c.Value(r)
 		}
 	case *array.Float64:
 		return func(r int) any {
@@ -337,17 +367,13 @@ func defaultValueAt(col arrow.Array, idx int) any {
 	case *array.Int64:
 		return arr.Value(idx)
 	case *array.Uint8:
-		return int64(arr.Value(idx))
+		return uint8(arr.Value(idx))
 	case *array.Uint16:
-		return int64(arr.Value(idx))
+		return uint16(arr.Value(idx))
 	case *array.Uint32:
-		return int64(arr.Value(idx))
+		return arr.Value(idx)
 	case *array.Uint64:
-		v := arr.Value(idx)
-		if v > math.MaxInt64 {
-			return int64(math.MaxInt64)
-		}
-		return int64(v)
+		return arr.Value(idx)
 	case *array.Float32:
 		return arr.Value(idx)
 	case *array.Float64:
