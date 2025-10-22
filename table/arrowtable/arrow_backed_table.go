@@ -7,6 +7,7 @@ package arrowtable
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -37,11 +38,15 @@ type PartitionManager struct {
 // interface expected by go-mysql-server. Each partition comprises 65,536 rows at
 // most and may span multiple Arrow chunks.
 type ArrowBackedTable struct {
-	name     string
-	schema   sql.Schema
-	arrTable arrow.Table
-	pushed   []sql.Expression
-	pm       *PartitionManager
+	name                 string
+	baseSchema           sql.Schema
+	schema               sql.Schema
+	columnLookup         map[string]int
+	projection           []int
+	projectedArrowSchema *arrow.Schema
+	arrTable             arrow.Table
+	pushed               []sql.Expression
+	pm                   *PartitionManager
 }
 
 // NewArrowBackedTable wraps the provided Arrow table. The Arrow table is
@@ -59,8 +64,23 @@ func NewArrowBackedTable(name string, arrTable arrow.Table) (*ArrowBackedTable, 
 		return nil, err
 	}
 
+	base := make(sql.Schema, len(schema))
+	copy(base, schema)
+
+	lookup := make(map[string]int, len(base))
+	for i, col := range base {
+		lookup[strings.ToLower(col.Name)] = i
+	}
+
 	arrTable.Retain()
-	return &ArrowBackedTable{name: name, schema: schema, arrTable: arrTable, pm: pm}, nil
+	return &ArrowBackedTable{
+		name:         name,
+		baseSchema:   base,
+		schema:       base,
+		columnLookup: lookup,
+		arrTable:     arrTable,
+		pm:           pm,
+	}, nil
 }
 
 // Name implements sql.Table.
@@ -104,6 +124,53 @@ func (t *ArrowBackedTable) WithFilters(ctx *sql.Context, filters []sql.Expressio
 	nt := *t
 	nt.pushed = t.HandledFilters(filters)
 	return &nt
+}
+
+// WithProjections implements sql.ProjectedTable. The returned copy remembers
+// which columns were requested so that Arrow record materialisation can skip
+// unnecessary arrays.
+func (t *ArrowBackedTable) WithProjections(columns []string) sql.Table {
+	nt := *t
+
+	if len(columns) == 0 {
+		nt.schema = sql.Schema{}
+		nt.projection = make([]int, 0)
+		nt.projectedArrowSchema = projectArrowSchema(t.arrTable.Schema(), nt.projection)
+		return &nt
+	}
+
+	indices := make([]int, len(columns))
+	projected := make(sql.Schema, len(columns))
+	for i, col := range columns {
+		idx, ok := t.columnLookup[strings.ToLower(col)]
+		if !ok {
+			nt.schema = nt.baseSchema
+			nt.projection = nil
+			nt.projectedArrowSchema = nil
+			return &nt
+		}
+		indices[i] = idx
+		projected[i] = t.baseSchema[idx]
+	}
+
+	nt.projection = indices
+	nt.schema = projected
+	nt.projectedArrowSchema = projectArrowSchema(t.arrTable.Schema(), indices)
+	return &nt
+}
+
+// Projections reports the column names currently projected for this table, or
+// nil when all columns should be returned.
+func (t *ArrowBackedTable) Projections() []string {
+	if t.projection == nil {
+		return nil
+	}
+
+	names := make([]string, len(t.schema))
+	for i, col := range t.schema {
+		names[i] = col.Name
+	}
+	return names
 }
 
 type chunkPartition struct {
@@ -219,12 +286,46 @@ func (t *ArrowBackedTable) sliceRecordForSegment(seg RowRange) (arrow.Record, er
 		return rec, nil
 	}
 
-	numCols := int(t.arrTable.NumCols())
-	cols := make([]arrow.Array, numCols)
-	for i := 0; i < numCols; i++ {
-		data := t.arrTable.Column(i).Data()
+	if t.projection == nil {
+		numCols := int(t.arrTable.NumCols())
+		cols := make([]arrow.Array, numCols)
+		for i := 0; i < numCols; i++ {
+			data := t.arrTable.Column(i).Data()
+			if seg.Chunk < 0 || seg.Chunk >= len(data.Chunks()) {
+				return nil, fmt.Errorf("segment chunk index out of range: chunk=%d col=%d", seg.Chunk, i)
+			}
+			chunk := data.Chunk(seg.Chunk)
+			clen := int64(chunk.Len())
+			if seg.Offset < 0 || seg.Offset+seg.Length > clen {
+				return nil, fmt.Errorf("segment slice out of bounds: chunk=%d len=%d want=[%d,%d)", seg.Chunk, chunk.Len(), seg.Offset, seg.Offset+seg.Length)
+			}
+			arr := array.NewSlice(chunk, seg.Offset, seg.Offset+seg.Length)
+			cols[i] = arr
+		}
+
+		rec := array.NewRecord(t.arrTable.Schema(), cols, seg.Length)
+		for _, col := range cols {
+			col.Release()
+		}
+		return rec, nil
+	}
+
+	if len(t.projection) == 0 {
+		schema := t.projectedArrowSchema
+		if schema == nil {
+			schema = projectArrowSchema(t.arrTable.Schema(), t.projection)
+		}
+		return array.NewRecord(schema, nil, seg.Length), nil
+	}
+
+	cols := make([]arrow.Array, len(t.projection))
+	for outIdx, colIdx := range t.projection {
+		if colIdx < 0 || colIdx >= int(t.arrTable.NumCols()) {
+			return nil, fmt.Errorf("projection column index out of range: %d", colIdx)
+		}
+		data := t.arrTable.Column(colIdx).Data()
 		if seg.Chunk < 0 || seg.Chunk >= len(data.Chunks()) {
-			return nil, fmt.Errorf("segment chunk index out of range: chunk=%d col=%d", seg.Chunk, i)
+			return nil, fmt.Errorf("segment chunk index out of range: chunk=%d col=%d", seg.Chunk, colIdx)
 		}
 		chunk := data.Chunk(seg.Chunk)
 		clen := int64(chunk.Len())
@@ -232,14 +333,45 @@ func (t *ArrowBackedTable) sliceRecordForSegment(seg RowRange) (arrow.Record, er
 			return nil, fmt.Errorf("segment slice out of bounds: chunk=%d len=%d want=[%d,%d)", seg.Chunk, chunk.Len(), seg.Offset, seg.Offset+seg.Length)
 		}
 		arr := array.NewSlice(chunk, seg.Offset, seg.Offset+seg.Length)
-		cols[i] = arr
+		cols[outIdx] = arr
 	}
 
-	rec := array.NewRecord(t.arrTable.Schema(), cols, seg.Length)
+	schema := t.projectedArrowSchema
+	if schema == nil {
+		schema = projectArrowSchema(t.arrTable.Schema(), t.projection)
+	}
+
+	rec := array.NewRecord(schema, cols, seg.Length)
 	for _, col := range cols {
 		col.Release()
 	}
 	return rec, nil
+}
+
+func projectArrowSchema(base *arrow.Schema, indices []int) *arrow.Schema {
+	if base == nil {
+		return nil
+	}
+	if indices == nil {
+		return base
+	}
+	if len(indices) == 0 {
+		md := base.Metadata()
+		return arrow.NewSchema(nil, &md)
+	}
+
+	fields := make([]arrow.Field, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(base.Fields()) {
+			continue
+		}
+		fields = append(fields, base.Field(idx))
+	}
+	if len(fields) == 0 {
+		return base
+	}
+	md := base.Metadata()
+	return arrow.NewSchema(fields, &md)
 }
 
 func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
@@ -305,3 +437,4 @@ func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
 }
 
 var _ sql.FilteredTable = (*ArrowBackedTable)(nil)
+var _ sql.ProjectedTable = (*ArrowBackedTable)(nil)
