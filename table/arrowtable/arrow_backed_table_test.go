@@ -383,6 +383,54 @@ func TestArrowBackedTableProjectionOrder(t *testing.T) {
 	}
 }
 
+func TestArrowBackedTableProjectionPrimaryKeyRemap(t *testing.T) {
+	tbl := buildTestArrowTable(t)
+	abt, err := NewArrowBackedTable("t", tbl)
+	if err != nil {
+		t.Fatalf("NewArrowBackedTable: %v", err)
+	}
+	defer abt.arrTable.Release()
+	tbl.Release()
+
+	// Mark the id column as the primary key to simulate table metadata.
+	if len(abt.baseSchema) == 0 {
+		t.Fatal("expected base schema to contain columns")
+	}
+	abt.baseSchema[0].PrimaryKey = true
+
+	basePK := abt.PrimaryKeySchema()
+	if len(basePK.PkOrdinals) != 1 || basePK.PkOrdinals[0] != 0 {
+		t.Fatalf("expected base primary key ordinal 0, got %#v", basePK.PkOrdinals)
+	}
+
+	projected := abt.WithProjections([]string{"v", "id"}).(*ArrowBackedTable)
+	pk := projected.PrimaryKeySchema()
+	if len(pk.Schema) != 2 {
+		t.Fatalf("expected projected schema to have 2 columns, got %d", len(pk.Schema))
+	}
+	if len(pk.PkOrdinals) != 1 || pk.PkOrdinals[0] != 1 {
+		t.Fatalf("expected projected primary key ordinal 1, got %#v", pk.PkOrdinals)
+	}
+
+	dropped := abt.WithProjections([]string{"v"}).(*ArrowBackedTable)
+	pk = dropped.PrimaryKeySchema()
+	if len(pk.PkOrdinals) != 0 {
+		t.Fatalf("expected keyless schema after dropping primary key column, got %#v", pk.PkOrdinals)
+	}
+
+	spooled := abt.WithProjections([]string{}).(*ArrowBackedTable)
+	pk = spooled.PrimaryKeySchema()
+	if len(pk.Schema) != 0 || len(pk.PkOrdinals) != 0 {
+		t.Fatalf("expected empty schema to remain keyless, got schema=%d pks=%#v", len(pk.Schema), pk.PkOrdinals)
+	}
+
+	// Ensure the original table continues to report the base primary key.
+	basePK = abt.PrimaryKeySchema()
+	if len(basePK.PkOrdinals) != 1 || basePK.PkOrdinals[0] != 0 {
+		t.Fatalf("base table primary key unexpectedly changed: %#v", basePK.PkOrdinals)
+	}
+}
+
 func TestArrowBackedTableBetweenCasts(t *testing.T) {
 	tbl := buildTestArrowTable(t)
 	abt, err := NewArrowBackedTable("t", tbl)

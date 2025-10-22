@@ -50,6 +50,7 @@ type ParquetBackedTable struct {
 }
 
 var _ sql.FilteredTable = (*ParquetBackedTable)(nil)
+var _ sql.PrimaryKeyTable = (*ParquetBackedTable)(nil)
 
 // NewParquetBackedTable opens the provided Parquet file to build the SQL schema
 // and discover the number of available row groups.
@@ -113,6 +114,14 @@ func (t *ParquetBackedTable) Schema() sql.Schema { return t.schema }
 
 // Collation implements sql.Table by returning the default MySQL collation.
 func (t *ParquetBackedTable) Collation() sql.CollationID { return sql.Collation_Default }
+
+// PrimaryKeySchema implements sql.PrimaryKeyTable by remapping the primary key
+// ordinals of the base schema through any requested projection. If a projection
+// removes a primary key column the table advertises itself as keyless to avoid
+// mismatches between Schema() and PrimaryKeySchema().
+func (t *ParquetBackedTable) PrimaryKeySchema() sql.PrimaryKeySchema {
+	return remapPrimaryKeySchema(t.baseSchema, t.projection, t.schema)
+}
 
 // Filters returns the filter expressions that will be pushed down into Arrow
 // compute. A nil slice signals that no pushdown is configured.
@@ -292,6 +301,43 @@ func (s *pqarrowRecordSource) Release() {
 		_ = s.file.Close()
 		s.file = nil
 	}
+}
+
+func remapPrimaryKeySchema(base sql.Schema, projection []int, current sql.Schema) sql.PrimaryKeySchema {
+	if len(current) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	basePK := sql.NewPrimaryKeySchema(base)
+	if len(basePK.PkOrdinals) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	if projection == nil {
+		ords := make([]int, len(basePK.PkOrdinals))
+		copy(ords, basePK.PkOrdinals)
+		return sql.PrimaryKeySchema{Schema: current, PkOrdinals: ords}
+	}
+
+	if len(projection) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	remap := make(map[int]int, len(projection))
+	for projIdx, baseIdx := range projection {
+		remap[baseIdx] = projIdx
+	}
+
+	ords := make([]int, 0, len(basePK.PkOrdinals))
+	for _, baseOrd := range basePK.PkOrdinals {
+		projOrd, ok := remap[baseOrd]
+		if !ok {
+			return sql.PrimaryKeySchema{Schema: current}
+		}
+		ords = append(ords, projOrd)
+	}
+
+	return sql.PrimaryKeySchema{Schema: current, PkOrdinals: ords}
 }
 
 // WithProjections implements sql.ProjectedTable. The returned copy remembers

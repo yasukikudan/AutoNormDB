@@ -92,6 +92,15 @@ func (t *ArrowBackedTable) String() string { return t.name }
 // Schema implements sql.Table.
 func (t *ArrowBackedTable) Schema() sql.Schema { return t.schema }
 
+// PrimaryKeySchema implements sql.PrimaryKeyTable by remapping the base schema's
+// primary key ordinals through any active projection. If the projection removes
+// a primary key column the table must report itself as keyless to avoid
+// go-mysql-server attempting to access out-of-range schema slots while building
+// memoized plans.
+func (t *ArrowBackedTable) PrimaryKeySchema() sql.PrimaryKeySchema {
+	return remapPrimaryKeySchema(t.baseSchema, t.projection, t.schema)
+}
+
 // Filters returns the filter expressions that will be pushed down into Arrow
 // compute. When no filters are tracked the method returns nil so that go-mysql-
 // server understands no pushdown has been configured.
@@ -438,3 +447,47 @@ func buildPartitionManager(tbl arrow.Table) (*PartitionManager, error) {
 
 var _ sql.FilteredTable = (*ArrowBackedTable)(nil)
 var _ sql.ProjectedTable = (*ArrowBackedTable)(nil)
+var _ sql.PrimaryKeyTable = (*ArrowBackedTable)(nil)
+
+func remapPrimaryKeySchema(base sql.Schema, projection []int, current sql.Schema) sql.PrimaryKeySchema {
+	if len(current) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	basePK := sql.NewPrimaryKeySchema(base)
+	if len(basePK.PkOrdinals) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	// No projection active, so the primary key ordinals already line up with
+	// the current schema ordering.
+	if projection == nil {
+		ords := make([]int, len(basePK.PkOrdinals))
+		copy(ords, basePK.PkOrdinals)
+		return sql.PrimaryKeySchema{Schema: current, PkOrdinals: ords}
+	}
+
+	// A projection that requests zero columns is used for spool nodes. Such
+	// tables are effectively keyless because they expose no schema.
+	if len(projection) == 0 {
+		return sql.PrimaryKeySchema{Schema: current}
+	}
+
+	remap := make(map[int]int, len(projection))
+	for projIdx, baseIdx := range projection {
+		remap[baseIdx] = projIdx
+	}
+
+	ords := make([]int, 0, len(basePK.PkOrdinals))
+	for _, baseOrd := range basePK.PkOrdinals {
+		projOrd, ok := remap[baseOrd]
+		if !ok {
+			// One or more primary key columns were projected out, so
+			// the projected table must not claim to have a primary key.
+			return sql.PrimaryKeySchema{Schema: current}
+		}
+		ords = append(ords, projOrd)
+	}
+
+	return sql.PrimaryKeySchema{Schema: current, PkOrdinals: ords}
+}
