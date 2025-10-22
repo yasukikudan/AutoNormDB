@@ -16,6 +16,7 @@ import (
 	arrowfile "github.com/apache/arrow/go/v15/parquet/file"
 	"github.com/apache/arrow/go/v15/parquet/metadata"
 	arrowpqarrow "github.com/apache/arrow/go/v15/parquet/pqarrow"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 
@@ -234,7 +235,7 @@ func (t *ParquetBackedTable) PartitionRows(ctx *sql.Context, p sql.Partition) (s
 			candidates = []int{rp.index}
 		}
 		if len(candidates) > 0 {
-			pruned := pruneRowGroups(rdr.MetaData(), t.columnLookup, candidates, constraints)
+			pruned := pruneRowGroups(rdr, rdr.MetaData(), t.columnLookup, candidates, constraints)
 			if len(pruned) == 0 {
 				rdr.Close()
 				return sql.RowsToRowIter(), nil
@@ -448,6 +449,7 @@ type columnConstraint struct {
 	minInclusive bool
 	maxInclusive bool
 	invalid      bool
+	equals       map[comparableValue]struct{}
 }
 
 func (c *columnConstraint) tightenMin(val comparableValue, inclusive bool) {
@@ -518,6 +520,29 @@ func (c *columnConstraint) contradiction() bool {
 	return false
 }
 
+func (c *columnConstraint) addEquality(val comparableValue) {
+	if c.invalid {
+		return
+	}
+	if c.equals == nil {
+		c.equals = make(map[comparableValue]struct{})
+	}
+	c.equals[val] = struct{}{}
+	c.tightenMin(val, true)
+	c.tightenMax(val, true)
+}
+
+func (c *columnConstraint) hasEquals() bool { return len(c.equals) > 0 }
+
+func (c *columnConstraint) hasRange() bool { return c.min != nil || c.max != nil }
+
+func (c *columnConstraint) usable() bool {
+	if c == nil || c.invalid {
+		return false
+	}
+	return c.hasRange() || c.hasEquals()
+}
+
 func makeComparable(v interface{}) (comparableValue, bool) {
 	switch val := v.(type) {
 	case int:
@@ -584,7 +609,7 @@ func buildColumnConstraints(filters []sql.Expression) (map[string]*columnConstra
 		}
 	}
 	for name, c := range constraints {
-		if c == nil || c.invalid {
+		if c == nil || !c.usable() {
 			delete(constraints, name)
 		}
 	}
@@ -638,6 +663,8 @@ func applyConstraintExpr(constraints map[string]*columnConstraint, expr sql.Expr
 		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpLess, unsat)
 	case *expression.LessThanOrEqual:
 		applyBinaryConstraint(constraints, e.LeftChild, e.RightChild, compareOpLessEqual, unsat)
+	case *expression.InTuple:
+		applyInConstraint(constraints, e, unsat)
 	}
 }
 
@@ -656,6 +683,44 @@ func applyBinaryConstraint(constraints map[string]*columnConstraint, left, right
 	}
 }
 
+func applyInConstraint(constraints map[string]*columnConstraint, in *expression.InTuple, unsat *bool) {
+	if *unsat {
+		return
+	}
+	field, ok := in.Left().(*expression.GetField)
+	if !ok {
+		return
+	}
+	tuple, ok := in.Right().(expression.Tuple)
+	if !ok {
+		return
+	}
+	column := strings.ToLower(field.Name())
+	constraint := ensureConstraint(constraints, column)
+	if len(tuple) == 0 {
+		*unsat = true
+		return
+	}
+	var any bool
+	for _, expr := range tuple {
+		lit, ok := expr.(*expression.Literal)
+		if !ok {
+			constraint.invalid = true
+			continue
+		}
+		val, ok := makeComparable(lit.Value())
+		if !ok {
+			constraint.invalid = true
+			continue
+		}
+		constraint.addEquality(val)
+		any = true
+	}
+	if !any || constraint.contradiction() {
+		*unsat = true
+	}
+}
+
 func applyConstraintForField(constraints map[string]*columnConstraint, column string, raw interface{}, op compareOp, unsat *bool) {
 	constraint := ensureConstraint(constraints, column)
 	val, ok := makeComparable(raw)
@@ -665,8 +730,7 @@ func applyConstraintForField(constraints map[string]*columnConstraint, column st
 	}
 	switch op {
 	case compareOpEqual:
-		constraint.tightenMin(val, true)
-		constraint.tightenMax(val, true)
+		constraint.addEquality(val)
 	case compareOpGreater:
 		constraint.tightenMin(val, false)
 	case compareOpGreaterEqual:
@@ -705,7 +769,7 @@ func ensureConstraint(m map[string]*columnConstraint, column string) *columnCons
 	return c
 }
 
-func pruneRowGroups(meta *metadata.FileMetaData, lookup map[string]int, candidates []int, constraints map[string]*columnConstraint) []int {
+func pruneRowGroups(rdr *arrowfile.Reader, meta *metadata.FileMetaData, lookup map[string]int, candidates []int, constraints map[string]*columnConstraint) []int {
 	if meta == nil || len(constraints) == 0 {
 		return candidates
 	}
@@ -715,16 +779,16 @@ func pruneRowGroups(meta *metadata.FileMetaData, lookup map[string]int, candidat
 			continue
 		}
 		rg := meta.RowGroup(idx)
-		if rowGroupMatches(rg, lookup, constraints) {
+		if rowGroupMatches(rdr, idx, rg, lookup, constraints) {
 			out = append(out, idx)
 		}
 	}
 	return out
 }
 
-func rowGroupMatches(rg *metadata.RowGroupMetaData, lookup map[string]int, constraints map[string]*columnConstraint) bool {
+func rowGroupMatches(rdr *arrowfile.Reader, rowGroupIdx int, rg *metadata.RowGroupMetaData, lookup map[string]int, constraints map[string]*columnConstraint) bool {
 	for name, constraint := range constraints {
-		if constraint == nil {
+		if constraint == nil || !constraint.usable() {
 			continue
 		}
 		idx, ok := lookup[name]
@@ -735,16 +799,17 @@ func rowGroupMatches(rg *metadata.RowGroupMetaData, lookup map[string]int, const
 		if err != nil {
 			return true
 		}
-		stats, err := chunk.Statistics()
-		if err != nil || stats == nil || !stats.HasMinMax() {
-			continue
+		var statsMin, statsMax *comparableValue
+		if stats, err := chunk.Statistics(); err == nil && stats != nil && stats.HasMinMax() {
+			if minVal, maxVal, ok := statMinMax(stats); ok {
+				minCopy := minVal
+				maxCopy := maxVal
+				statsMin = &minCopy
+				statsMax = &maxCopy
+			}
 		}
-		minVal, maxVal, ok := statMinMax(stats)
-		if !ok {
-			continue
-		}
-		if constraint.min != nil {
-			cmp, ok := maxVal.compare(*constraint.min)
+		if constraint.min != nil && statsMax != nil {
+			cmp, ok := statsMax.compare(*constraint.min)
 			if ok {
 				if cmp < 0 {
 					return false
@@ -754,8 +819,8 @@ func rowGroupMatches(rg *metadata.RowGroupMetaData, lookup map[string]int, const
 				}
 			}
 		}
-		if constraint.max != nil {
-			cmp, ok := minVal.compare(*constraint.max)
+		if constraint.max != nil && statsMin != nil {
+			cmp, ok := statsMin.compare(*constraint.max)
 			if ok {
 				if cmp > 0 {
 					return false
@@ -765,8 +830,186 @@ func rowGroupMatches(rg *metadata.RowGroupMetaData, lookup map[string]int, const
 				}
 			}
 		}
+		if constraint.hasEquals() {
+			if statsMin != nil || statsMax != nil {
+				if !equalsOverlapStats(constraint.equals, statsMin, statsMax) {
+					return false
+				}
+				continue
+			}
+			if chunk.HasDictionaryPage() {
+				matches, ok := dictionaryContainsAny(rdr, rg, rowGroupIdx, idx, constraint.equals)
+				if ok && !matches {
+					return false
+				}
+			}
+		}
 	}
 	return true
+}
+
+func equalsOverlapStats(values map[comparableValue]struct{}, statsMin, statsMax *comparableValue) bool {
+	if len(values) == 0 {
+		return true
+	}
+	for val := range values {
+		if valueWithinStats(val, statsMin, statsMax) {
+			return true
+		}
+	}
+	return false
+}
+
+func valueWithinStats(val comparableValue, statsMin, statsMax *comparableValue) bool {
+	if statsMin != nil {
+		if cmp, ok := val.compare(*statsMin); ok {
+			if cmp < 0 {
+				return false
+			}
+		}
+	}
+	if statsMax != nil {
+		if cmp, ok := val.compare(*statsMax); ok {
+			if cmp > 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func dictionaryContainsAny(rdr *arrowfile.Reader, rg *metadata.RowGroupMetaData, rowGroupIdx, columnIdx int, equals map[comparableValue]struct{}) (bool, bool) {
+	if rdr == nil || rg == nil {
+		return true, false
+	}
+	rowGroupReader := rdr.RowGroup(rowGroupIdx)
+	pageReader, err := rowGroupReader.GetColumnPageReader(columnIdx)
+	if err != nil {
+		return true, false
+	}
+	for pageReader.Next() {
+		page := pageReader.Page()
+		if page == nil {
+			continue
+		}
+		dictPage, ok := page.(*arrowfile.DictionaryPage)
+		if !ok {
+			page.Release()
+			break
+		}
+		values, decodeOK := decodeDictionaryValues(dictPage, rg.Schema.Column(columnIdx))
+		page.Release()
+		if !decodeOK {
+			return true, false
+		}
+		for val := range equals {
+			if _, found := values[val]; found {
+				return true, true
+			}
+		}
+		return false, true
+	}
+	return true, true
+}
+
+func decodeDictionaryValues(page *arrowfile.DictionaryPage, column *schema.Column) (map[comparableValue]struct{}, bool) {
+	if page == nil || column == nil {
+		return nil, false
+	}
+	total := int(page.NumValues())
+	if total < 0 {
+		return nil, false
+	}
+	data := page.Data()
+	values := make(map[comparableValue]struct{}, total)
+	switch column.PhysicalType() {
+	case parquet.Types.Int32:
+		needed := total * 4
+		if len(data) < needed {
+			return nil, false
+		}
+		for i := 0; i < total; i++ {
+			start := i * 4
+			v := int32(binary.LittleEndian.Uint32(data[start : start+4]))
+			if cv, ok := makeComparable(v); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	case parquet.Types.Int64:
+		needed := total * 8
+		if len(data) < needed {
+			return nil, false
+		}
+		for i := 0; i < total; i++ {
+			start := i * 8
+			v := int64(binary.LittleEndian.Uint64(data[start : start+8]))
+			if cv, ok := makeComparable(v); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	case parquet.Types.Float:
+		needed := total * 4
+		if len(data) < needed {
+			return nil, false
+		}
+		for i := 0; i < total; i++ {
+			start := i * 4
+			bits := binary.LittleEndian.Uint32(data[start : start+4])
+			v := math.Float32frombits(bits)
+			if cv, ok := makeComparable(v); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	case parquet.Types.Double:
+		needed := total * 8
+		if len(data) < needed {
+			return nil, false
+		}
+		for i := 0; i < total; i++ {
+			start := i * 8
+			bits := binary.LittleEndian.Uint64(data[start : start+8])
+			v := math.Float64frombits(bits)
+			if cv, ok := makeComparable(v); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	case parquet.Types.ByteArray:
+		cursor := data
+		for i := 0; i < total; i++ {
+			if len(cursor) < 4 {
+				return nil, false
+			}
+			ln := int(binary.LittleEndian.Uint32(cursor[:4]))
+			cursor = cursor[4:]
+			if ln < 0 || len(cursor) < ln {
+				return nil, false
+			}
+			str := string(cursor[:ln])
+			cursor = cursor[ln:]
+			if cv, ok := makeComparable(str); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	case parquet.Types.FixedLenByteArray:
+		typeLen := int(column.TypeLength())
+		if typeLen <= 0 {
+			return nil, false
+		}
+		needed := total * typeLen
+		if len(data) < needed {
+			return nil, false
+		}
+		for i := 0; i < total; i++ {
+			start := i * typeLen
+			str := string(data[start : start+typeLen])
+			if cv, ok := makeComparable(str); ok {
+				values[cv] = struct{}{}
+			}
+		}
+	default:
+		return nil, false
+	}
+	return values, true
 }
 
 func statMinMax(stats metadata.TypedStatistics) (comparableValue, comparableValue, bool) {
