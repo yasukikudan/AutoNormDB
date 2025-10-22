@@ -312,6 +312,38 @@ func TestArrowBackedTableProjectionPushdown(t *testing.T) {
 	}
 }
 
+func TestArrowBackedTableProjectionSpool(t *testing.T) {
+	tbl := buildTestArrowTable(t)
+	abt, err := NewArrowBackedTable("t", tbl)
+	if err != nil {
+		t.Fatalf("NewArrowBackedTable: %v", err)
+	}
+	defer abt.arrTable.Release()
+	tbl.Release()
+
+	ctx := sql.NewEmptyContext()
+	spooled := abt.WithProjections([]string{}).(*ArrowBackedTable)
+
+	if schema := spooled.Schema(); len(schema) != 0 {
+		t.Fatalf("expected empty schema for spool projection, got %#v", schema)
+	}
+
+	if names := spooled.Projections(); names == nil || len(names) != 0 {
+		t.Fatalf("expected empty projection metadata, got %#v", names)
+	}
+
+	rows := collectAllRows(t, spooled, ctx)
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows after spool projection, got %d", len(rows))
+	}
+
+	for i, row := range rows {
+		if len(row) != 0 {
+			t.Fatalf("row %d expected 0 columns, got %d", i, len(row))
+		}
+	}
+}
+
 func TestArrowBackedTableProjectionOrder(t *testing.T) {
 	tbl := buildTestArrowTable(t)
 	abt, err := NewArrowBackedTable("t", tbl)

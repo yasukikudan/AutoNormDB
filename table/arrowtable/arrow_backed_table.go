@@ -130,34 +130,29 @@ func (t *ArrowBackedTable) WithFilters(ctx *sql.Context, filters []sql.Expressio
 // which columns were requested so that Arrow record materialisation can skip
 // unnecessary arrays.
 func (t *ArrowBackedTable) WithProjections(columns []string) sql.Table {
+	nt := *t
+
 	if len(columns) == 0 {
-		nt := *t
-		nt.schema = nt.baseSchema
-		nt.projection = nil
-		nt.projectedArrowSchema = nil
+		nt.schema = sql.Schema{}
+		nt.projection = make([]int, 0)
+		nt.projectedArrowSchema = projectArrowSchema(t.arrTable.Schema(), nt.projection)
 		return &nt
 	}
 
-	indices := make([]int, 0, len(columns))
-	projected := make(sql.Schema, 0, len(columns))
-	for _, col := range columns {
+	indices := make([]int, len(columns))
+	projected := make(sql.Schema, len(columns))
+	for i, col := range columns {
 		idx, ok := t.columnLookup[strings.ToLower(col)]
 		if !ok {
-			continue
+			nt.schema = nt.baseSchema
+			nt.projection = nil
+			nt.projectedArrowSchema = nil
+			return &nt
 		}
-		indices = append(indices, idx)
-		projected = append(projected, t.baseSchema[idx])
+		indices[i] = idx
+		projected[i] = t.baseSchema[idx]
 	}
 
-	if len(indices) == 0 {
-		nt := *t
-		nt.schema = nt.baseSchema
-		nt.projection = nil
-		nt.projectedArrowSchema = nil
-		return &nt
-	}
-
-	nt := *t
 	nt.projection = indices
 	nt.schema = projected
 	nt.projectedArrowSchema = projectArrowSchema(t.arrTable.Schema(), indices)
@@ -167,7 +162,7 @@ func (t *ArrowBackedTable) WithProjections(columns []string) sql.Table {
 // Projections reports the column names currently projected for this table, or
 // nil when all columns should be returned.
 func (t *ArrowBackedTable) Projections() []string {
-	if len(t.projection) == 0 {
+	if t.projection == nil {
 		return nil
 	}
 
@@ -291,7 +286,7 @@ func (t *ArrowBackedTable) sliceRecordForSegment(seg RowRange) (arrow.Record, er
 		return rec, nil
 	}
 
-	if len(t.projection) == 0 {
+	if t.projection == nil {
 		numCols := int(t.arrTable.NumCols())
 		cols := make([]arrow.Array, numCols)
 		for i := 0; i < numCols; i++ {
@@ -313,6 +308,14 @@ func (t *ArrowBackedTable) sliceRecordForSegment(seg RowRange) (arrow.Record, er
 			col.Release()
 		}
 		return rec, nil
+	}
+
+	if len(t.projection) == 0 {
+		schema := t.projectedArrowSchema
+		if schema == nil {
+			schema = projectArrowSchema(t.arrTable.Schema(), t.projection)
+		}
+		return array.NewRecord(schema, nil, seg.Length), nil
 	}
 
 	cols := make([]arrow.Array, len(t.projection))
@@ -349,8 +352,12 @@ func projectArrowSchema(base *arrow.Schema, indices []int) *arrow.Schema {
 	if base == nil {
 		return nil
 	}
-	if len(indices) == 0 {
+	if indices == nil {
 		return base
+	}
+	if len(indices) == 0 {
+		md := base.Metadata()
+		return arrow.NewSchema(nil, &md)
 	}
 
 	fields := make([]arrow.Field, 0, len(indices))
