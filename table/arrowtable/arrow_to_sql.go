@@ -43,14 +43,22 @@ func arrowFieldToSQLType(f arrow.Field) (sql.Type, error) {
 	// Arrow のデータ型を go-mysql-server の型にマッピングします。MySQL 側でサポートの薄い
 	// 型はより広い互換型（例: 文字列は LongText）へフォールバックしています。
 	switch dt := f.Type.(type) {
-	case *arrow.Int8Type, *arrow.Uint8Type:
+	case *arrow.Int8Type:
 		return types.Int8, nil
-	case *arrow.Int16Type, *arrow.Uint16Type:
+	case *arrow.Uint8Type:
+		return types.Uint8, nil
+	case *arrow.Int16Type:
 		return types.Int16, nil
-	case *arrow.Int32Type, *arrow.Uint32Type, *arrow.Date32Type:
+	case *arrow.Uint16Type:
+		return types.Uint16, nil
+	case *arrow.Int32Type, *arrow.Date32Type:
 		return types.Int32, nil
-	case *arrow.Int64Type, *arrow.Uint64Type, *arrow.TimestampType, *arrow.Date64Type:
+	case *arrow.Uint32Type:
+		return types.Uint32, nil
+	case *arrow.Int64Type, *arrow.TimestampType, *arrow.Date64Type:
 		return types.Int64, nil
+	case *arrow.Uint64Type:
+		return types.Uint64, nil
 	case *arrow.Float32Type:
 		return types.Float32, nil
 	case *arrow.Float64Type:
