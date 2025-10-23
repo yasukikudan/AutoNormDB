@@ -79,7 +79,20 @@ func (db *FileDatabase) GetTableInsensitive(ctx *sql.Context, name string) (sql.
 	}
 	sort.Strings(normalized)
 
-	key := cacheKeyFromPaths(normalized)
+	var cacheKey string
+	useCache := db.Cache != nil
+	if useCache {
+		cacheKey = cacheKeyFromPaths(normalized)
+		if tbl, ok := db.Cache.Get(cacheKey); ok {
+			wrapped, err := arrowtable.NewArrowBackedTable(raw, tbl)
+			tbl.Release()
+			if err != nil {
+				return nil, false, err
+			}
+			return wrapped, true, nil
+		}
+	}
+
 	if len(normalized) == 1 && strings.EqualFold(filepath.Ext(normalized[0]), ".parquet") {
 		tbl, err := parquettable.NewParquetBackedTable(raw, normalized[0])
 		if err != nil {
@@ -88,30 +101,24 @@ func (db *FileDatabase) GetTableInsensitive(ctx *sql.Context, name string) (sql.
 		return tbl, true, nil
 	}
 
-	if tbl, ok := db.Cache.Get(key); ok {
-		wrapped, err := arrowtable.NewArrowBackedTable(raw, tbl)
-		tbl.Release()
-		if err != nil {
-			return nil, false, err
-		}
-		return wrapped, true, nil
-	}
-
 	pool := memory.NewGoAllocator()
 	table, err := LoadArrowTable(normalized, pool)
 	if err != nil {
 		return nil, false, err
 	}
 
-	if db.Cache != nil {
-		db.Cache.Set(key, table)
+	if useCache {
+		if cacheKey == "" {
+			cacheKey = cacheKeyFromPaths(normalized)
+		}
+		db.Cache.Set(cacheKey, table)
 	}
 
 	wrapped, err := arrowtable.NewArrowBackedTable(raw, table)
 	table.Release()
 	if err != nil {
-		if db.Cache != nil {
-			db.Cache.Delete(key)
+		if useCache && cacheKey != "" {
+			db.Cache.Delete(cacheKey)
 		}
 		return nil, false, err
 	}
